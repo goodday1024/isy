@@ -202,14 +202,13 @@ public struct TerminalView: View {
 
     @ViewBuilder
     private func rowView(row: [TerminalCell], rowIdx: Int) -> some View {
-        let attributed = buildAttributedLine(from: row)
-        if attributed.string.allSatisfy({ $0 == " " || $0 == "\0" }) {
+        if row.allSatisfy({ $0.char == " " }) {
             // 空行: 占位
             Color.clear
                 .frame(height: lineHeight)
                 .padding(.horizontal, 8)
         } else {
-            Text(attributed)
+            Text(buildAttributedLine(from: row))
                 .font(terminalFont)
                 .frame(height: lineHeight)
                 .padding(.horizontal, 8)
@@ -242,17 +241,27 @@ public struct TerminalView: View {
                 }
             }
 
-            // 粗体
-            if cell.attrs.bold {
-                ch.font = .system(size: fontSize, weight: .bold, design: .monospaced)
+            // 粗体 + 斜体: 通过 font 设置
+            if cell.attrs.bold || cell.attrs.italic {
+                var font = Font.system(
+                    size: fontSize,
+                    weight: cell.attrs.bold ? .bold : .regular,
+                    design: .monospaced
+                )
+                if cell.attrs.italic {
+                    font = font.italic()
+                }
+                ch.font = font
             }
-            // 斜体
-            if cell.attrs.italic {
-                ch.inlinePresentationIntent = .italic
-            }
+
             // 下划线
             if cell.attrs.underline {
-                ch.inlinePresentationIntent = (ch.inlinePresentationIntent ?? []).union(.lineThrough)
+                ch.underlineStyle = Text.LineStyle(pattern: .solid)
+            }
+
+            // 删除线
+            if cell.attrs.strikethrough {
+                ch.strikethroughStyle = Text.LineStyle(pattern: .solid)
             }
 
             result += ch
