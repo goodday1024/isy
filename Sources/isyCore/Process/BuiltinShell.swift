@@ -106,15 +106,23 @@ public final class BuiltinShell: @unchecked Sendable {
         var redirectIn: String? = nil
         var redirectOut: String? = nil
         var redirectAppend = false
+        var skipNext = false
 
-        for ch in input {
+        let chars = Array(input)
+        var idx = 0
+        while idx < chars.count {
+            if skipNext { skipNext = false; idx += 1; continue }
+            let ch = chars[idx]
+
             if escaped {
                 current.append(ch)
                 escaped = false
+                idx += 1
                 continue
             }
             if ch == "\\" {
                 escaped = true
+                idx += 1
                 continue
             }
             if let q = inQuote {
@@ -123,10 +131,12 @@ public final class BuiltinShell: @unchecked Sendable {
                 } else {
                     current.append(ch)
                 }
+                idx += 1
                 continue
             }
             if ch == "\"" || ch == "'" {
                 inQuote = ch
+                idx += 1
                 continue
             }
             if ch == " " || ch == "\t" {
@@ -134,6 +144,7 @@ public final class BuiltinShell: @unchecked Sendable {
                     parts.append(current)
                     current = ""
                 }
+                idx += 1
                 continue
             }
             if ch == "|" {
@@ -141,8 +152,9 @@ public final class BuiltinShell: @unchecked Sendable {
                     parts.append(current)
                     current = ""
                 }
-                pipeIdx = parts.count
+                if pipeIdx < 0 { pipeIdx = parts.count }
                 parts.append("|")
+                idx += 1
                 continue
             }
             if ch == ">" {
@@ -150,10 +162,16 @@ public final class BuiltinShell: @unchecked Sendable {
                     parts.append(current)
                     current = ""
                 }
-                redirectAppend = false
-                if input.dropFirst(input.distance(from: input.startIndex, to: input.firstIndex(of: ">")!)).hasPrefix(">>") {
+                // Check for >>
+                if idx + 1 < chars.count && chars[idx + 1] == ">" {
+                    parts.append(">>")
                     redirectAppend = true
+                    skipNext = true
+                } else {
+                    parts.append(">")
+                    redirectAppend = false
                 }
+                idx += 1
                 continue
             }
             if ch == "<" {
@@ -161,9 +179,12 @@ public final class BuiltinShell: @unchecked Sendable {
                     parts.append(current)
                     current = ""
                 }
+                parts.append("<")
+                idx += 1
                 continue
             }
             current.append(ch)
+            idx += 1
         }
         if !current.isEmpty { parts.append(current) }
 
@@ -231,17 +252,9 @@ public final class BuiltinShell: @unchecked Sendable {
             expandedArgs = expandedArgs.flatMap { expandGlob($0) }
         }
 
-        let expandedCmd = ShellCommand(
-            name: name, args: expandedArgs,
-            inputRedirect: cmd.inputRedirect,
-            outputRedirect: cmd.outputRedirect,
-            outputAppend: cmd.outputAppend,
-            nextPipe: cmd.nextPipe
-        )
-
         // 读取输入重定向
         let inputContent: String?
-        if let inFile = expandedCmd.inputRedirect {
+        if let inFile = cmd.inputRedirect {
             inputContent = readFile(inFile)
         } else {
             inputContent = nil
@@ -249,23 +262,23 @@ public final class BuiltinShell: @unchecked Sendable {
 
         switch name {
         case "help":   output = shellHelp()
-        case "ls":     output = builtinLs(expandedCmd.args)
-        case "cat":    output = builtinCat(expandedCmd.args, input: inputContent)
-        case "echo":   output = builtinEcho(expandedCmd.args)
+        case "ls":     output = builtinLs(expandedArgs)
+        case "cat":    output = builtinCat(expandedArgs, input: inputContent)
+        case "echo":   output = builtinEcho(expandedArgs)
         case "pwd":    output = builtinPwd()
-        case "cd":     output = builtinCd(expandedCmd.args)
-        case "mkdir":  output = builtinMkdir(expandedCmd.args)
-        case "rm":     output = builtinRm(expandedCmd.args)
-        case "cp":     output = builtinCp(expandedCmd.args)
-        case "mv":     output = builtinMv(expandedCmd.args)
-        case "touch":  output = builtinTouch(expandedCmd.args)
-        case "chmod":  output = builtinChmod(expandedCmd.args)
-        case "head":   output = builtinHead(expandedCmd.args, input: inputContent)
-        case "tail":   output = builtinTail(expandedCmd.args, input: inputContent)
-        case "wc":     output = builtinWc(expandedCmd.args, input: inputContent)
-        case "grep":   output = builtinGrep(expandedCmd.args, input: inputContent)
+        case "cd":     output = builtinCd(expandedArgs)
+        case "mkdir":  output = builtinMkdir(expandedArgs)
+        case "rm":     output = builtinRm(expandedArgs)
+        case "cp":     output = builtinCp(expandedArgs)
+        case "mv":     output = builtinMv(expandedArgs)
+        case "touch":  output = builtinTouch(expandedArgs)
+        case "chmod":  output = builtinChmod(expandedArgs)
+        case "head":   output = builtinHead(expandedArgs, input: inputContent)
+        case "tail":   output = builtinTail(expandedArgs, input: inputContent)
+        case "wc":     output = builtinWc(expandedArgs, input: inputContent)
+        case "grep":   output = builtinGrep(expandedArgs, input: inputContent)
         case "env":    output = builtinEnv()
-        case "which":  output = builtinWhich(expandedCmd.args)
+        case "which":  output = builtinWhich(expandedArgs)
         case "clear":  output = "\u{1B}[2J\u{1B}[H"
         case "exit":   running = false; output = "exit"
         case "isy":    output = isyInfo()
@@ -273,31 +286,31 @@ public final class BuiltinShell: @unchecked Sendable {
         case "id":     output = "uid=0(root) gid=0(root) groups=0(root)"
         case "whoami": output = "root"
         case "date":   output = builtinDate()
-        case "sleep":  output = builtinSleep(expandedCmd.args)
+        case "sleep":  output = builtinSleep(expandedArgs)
         case "true":   output = ""
         case "false":  output = ""
-        case "test", "[": output = builtinTest(expandedCmd.args)
-        case "printf": output = builtinPrintf(expandedCmd.args)
-        case "kill":   output = builtinKill(expandedCmd.args)
+        case "test", "[": output = builtinTest(expandedArgs)
+        case "printf": output = builtinPrintf(expandedArgs)
+        case "kill":   output = builtinKill(expandedArgs)
         case "ps":     output = builtinPs()
         case "df":     output = builtinDf()
-        case "du":     output = builtinDu(expandedCmd.args)
-        case "sort":   output = builtinSort(expandedCmd.args, input: inputContent)
-        case "uniq":   output = builtinUniq(expandedCmd.args, input: inputContent)
-        case "tr":     output = builtinTr(expandedCmd.args, input: inputContent)
-        case "cut":    output = builtinCut(expandedCmd.args, input: inputContent)
-        case "tee":    output = builtinTee(expandedCmd.args, input: inputContent)
-        case "seq":    output = builtinSeq(expandedCmd.args)
-        case "expr":   output = builtinExpr(expandedCmd.args)
-        case "dirname": output = builtinDirname(expandedCmd.args)
-        case "basename": output = builtinBasename(expandedCmd.args)
+        case "du":     output = builtinDu(expandedArgs)
+        case "sort":   output = builtinSort(expandedArgs, input: inputContent)
+        case "uniq":   output = builtinUniq(expandedArgs, input: inputContent)
+        case "tr":     output = builtinTr(expandedArgs, input: inputContent)
+        case "cut":    output = builtinCut(expandedArgs, input: inputContent)
+        case "tee":    output = builtinTee(expandedArgs, input: inputContent)
+        case "seq":    output = builtinSeq(expandedArgs)
+        case "expr":   output = builtinExpr(expandedArgs)
+        case "dirname": output = builtinDirname(expandedArgs)
+        case "basename": output = builtinBasename(expandedArgs)
         default:
             output = "\(cmd.name): command not found (内置 shell, 输入 help 查看可用命令)"
             env.lastExitCode = 127
         }
 
         // 管道
-        if let next = expandedCmd.nextPipe {
+        if let next = cmd.nextPipe {
             let nextInput = output
             let nextCmd = ShellCommand(
                 name: next.name, args: next.args,
@@ -310,8 +323,8 @@ public final class BuiltinShell: @unchecked Sendable {
         }
 
         // 输出重定向
-        if let outFile = expandedCmd.outputRedirect {
-            writeFile(outFile, content: output, append: expandedCmd.outputAppend)
+        if let outFile = cmd.outputRedirect {
+            writeFile(outFile, content: output, append: cmd.outputAppend)
             return ""
         }
 
@@ -415,38 +428,86 @@ public final class BuiltinShell: @unchecked Sendable {
 
     private func builtinLs(_ args: [String]) -> String {
         let fm = FileManager.default
-        let path = args.first(where: { !$0.hasPrefix("-") }) ?? "."
-        let showAll = args.contains("-a") || args.contains("-la") || args.contains("-al")
-        let longFormat = args.contains("-l") || args.contains("-la") || args.contains("-al")
-        let resolved = env.hostPath(env.resolve(path))
+        let flags = args.filter { $0.hasPrefix("-") }
+        let showAll = flags.contains("-a") || flags.contains("-la") || flags.contains("-al")
+        let longFormat = flags.contains("-l") || flags.contains("-la") || flags.contains("-al")
+        let paths = args.filter { !$0.hasPrefix("-") }
 
-        guard let items = try? fm.contentsOfDirectory(atPath: resolved) else {
-            env.lastExitCode = 2
-            return "ls: cannot access '\(path)': No such file or directory"
-        }
+        // If no paths, default to "."
+        let targets = paths.isEmpty ? ["."] : paths
 
-        let sorted = items.sorted().filter { showAll || !$0.hasPrefix(".") }
+        var output = ""
+        var first = true
+        for target in targets {
+            let resolved = env.hostPath(env.resolve(target))
+            var isDir: ObjCBool = false
+            let exists = fm.fileExists(atPath: resolved, isDirectory: &isDir)
 
-        if longFormat {
-            var output = ""
-            for item in sorted {
-                let fullPath = resolved + "/" + item
-                var st = stat()
-                guard stat(fullPath, &st) == 0 else { continue }
-                let type = modeChar(st.st_mode)
-                let perms = permString(st.st_mode)
-                let size = st.st_size
-                #if canImport(Darwin)
-                let modDate = formatModTime(Int(st.st_mtimespec.tv_sec))
-                #else
-                let modDate = formatModTime(Int(st.st_mtim.tv_sec))
-                #endif
-                output += "\(type)\(perms) \(String(format: "%8lld", size)) \(modDate) \(item)\n"
+            if !exists {
+                env.lastExitCode = 2
+                output += "ls: cannot access '\(target)': No such file or directory\n"
+                continue
             }
-            return output
+
+            if !isDir.boolValue {
+                // It's a file - just show its name
+                if !first { output += "\n" }
+                if longFormat {
+                    var st = stat()
+                    if stat(resolved, &st) == 0 {
+                        let type = modeChar(st.st_mode)
+                        let perms = permString(st.st_mode)
+                        let size = st.st_size
+                        #if canImport(Darwin)
+                        let modDate = formatModTime(Int(st.st_mtimespec.tv_sec))
+                        #else
+                        let modDate = formatModTime(Int(st.st_mtim.tv_sec))
+                        #endif
+                        output += "\(type)\(perms) \(String(format: "%8lld", size)) \(modDate) \(target)\n"
+                    }
+                } else {
+                    output += target
+                }
+                first = false
+                continue
+            }
+
+            // It's a directory - list its contents
+            guard let items = try? fm.contentsOfDirectory(atPath: resolved) else {
+                env.lastExitCode = 2
+                output += "ls: cannot access '\(target)': No such file or directory\n"
+                continue
+            }
+
+            let sorted = items.sorted().filter { showAll || !$0.hasPrefix(".") }
+
+            if targets.count > 1 {
+                if !first { output += "\n" }
+                output += "\(target):\n"
+            }
+
+            if longFormat {
+                for item in sorted {
+                    let fullPath = resolved + "/" + item
+                    var st = stat()
+                    guard stat(fullPath, &st) == 0 else { continue }
+                    let type = modeChar(st.st_mode)
+                    let perms = permString(st.st_mode)
+                    let size = st.st_size
+                    #if canImport(Darwin)
+                    let modDate = formatModTime(Int(st.st_mtimespec.tv_sec))
+                    #else
+                    let modDate = formatModTime(Int(st.st_mtim.tv_sec))
+                    #endif
+                    output += "\(type)\(perms) \(String(format: "%8lld", size)) \(modDate) \(item)\n"
+                }
+            } else {
+                output += sorted.joined(separator: "  ")
+            }
+            first = false
         }
 
-        return sorted.joined(separator: "  ")
+        return output
     }
 
     private func builtinCat(_ args: [String], input: String?) -> String {
@@ -788,14 +849,159 @@ public final class BuiltinShell: @unchecked Sendable {
         return result
     }
 
-    private func builtinKill(_ args: [String]) -> String { "" }
+    private func builtinKill(_ args: [String]) -> String {
+        var signal: Int32 = 15  // SIGTERM
+        var pids: [Int32] = []
+        var i = 0
+        while i < args.count {
+            if args[i].hasPrefix("-") {
+                let sigStr = String(args[i].dropFirst())
+                if let sig = Int32(sigStr) {
+                    signal = sig
+                } else if sigStr.lowercased() == "kill" {
+                    signal = 9
+                } else if sigStr.lowercased() == "term" {
+                    signal = 15
+                } else if sigStr.lowercased() == "int" {
+                    signal = 2
+                } else if sigStr.lowercased() == "hup" {
+                    signal = 1
+                } else if sigStr.lowercased() == "stop" {
+                    signal = 19
+                } else if sigStr.lowercased() == "cont" {
+                    signal = 18
+                } else {
+                    // Try to parse signal number from name
+                    signal = 15
+                }
+            } else {
+                if let pid = Int32(args[i]) {
+                    pids.append(pid)
+                }
+            }
+            i += 1
+        }
+
+        if pids.isEmpty {
+            env.lastExitCode = 1
+            return "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ..."
+        }
+
+        var errors: [String] = []
+        for pid in pids {
+            if kill(pid, signal) != 0 {
+                let err = String(cString: strerror(errno))
+                errors.append("kill: (\(pid)) - \(err)")
+            }
+        }
+
+        if !errors.isEmpty {
+            env.lastExitCode = 1
+            return errors.joined(separator: "\n")
+        }
+        return ""
+    }
 
     private func builtinPs() -> String {
-        "  PID TTY      STAT   TIME COMMAND\n    1 ?        S      0:00 /bin/sh\n"
+        var output = "  PID TTY      STAT   TIME COMMAND\n"
+        // 获取当前进程以及子进程信息
+        // 在 demo 模式下，列出宿主环境中与本沙箱相关的进程
+        #if canImport(Darwin)
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size: Int = 0
+        if sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0 {
+            let procCount = size / MemoryLayout<kinfo_proc>.stride
+            let procs = UnsafeMutablePointer<kinfo_proc>.allocate(capacity: procCount)
+            defer { procs.deallocate() }
+            if sysctl(&mib, u_int(mib.count), procs, &size, nil, 0) == 0 {
+                for i in 0..<min(procCount, 50) {
+                    let p = procs[i]
+                    let pid = p.kp_proc.p_pid
+                    let comm = withUnsafePointer(to: p.kp_proc.p_comm) {
+                        $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
+                            String(cString: $0)
+                        }
+                    }
+                    let status = p.kp_proc.p_stat
+                    let statChar: Character
+                    switch status {
+                    case 2: statChar = "S"
+                    case 3: statChar = "R"
+                    case 4: statChar = "T"
+                    case 5: statChar = "Z"
+                    default: statChar = "?"
+                    }
+                    // 只显示 isy 相关进程
+                    let isIsy = comm.contains("isy") || comm.contains("sh") || comm.contains("bash") || pid <= 2
+                    if isIsy || pid <= 2 {
+                        let tty = "?"
+                        let time = "0:00"
+                        output += String(format: "%5d %-7s %-5c %6s %s\n", pid, tty, statChar, time, comm)
+                    }
+                }
+            }
+        }
+        #else
+        // Linux: 读取 /proc
+        let procDir = "/proc"
+        if let entries = try? FileManager.default.contentsOfDirectory(atPath: procDir) {
+            let pidEntries = entries.compactMap { Int32($0) }.sorted().prefix(50)
+            for pid in pidEntries {
+                let statFile = "/proc/\(pid)/stat"
+                if let statContent = try? String(contentsOfFile: statFile, encoding: .utf8) {
+                    let parts = statContent.split(separator: " ")
+                    if parts.count >= 3 {
+                        let comm = String(parts[1]).trimmingCharacters(in: CharacterSet(charactersIn: "()"))
+                        let statChar = String(parts[2])
+                        let tty = "?"
+                        let time = "0:00"
+                        output += String(format: "%5d %-7s %-5s %6s %s\n", pid, tty, statChar, time, comm)
+                    }
+                }
+            }
+        }
+        #endif
+        return output
     }
 
     private func builtinDf() -> String {
-        "Filesystem     1K-blocks    Used Available Use% Mounted on\noverlay         4000000 1000000   3000000  25% /\n"
+        var output = "Filesystem     1K-blocks    Used Available Use% Mounted on\n"
+        // 获取当前工作目录的文件系统信息
+        let cwdHost = env.hostPath(env.cwd)
+        var s = statvfs()
+        if statvfs(cwdHost, &s) == 0 {
+            let blockSize = UInt64(s.f_frsize > 0 ? s.f_frsize : s.f_bsize)
+            let totalBlocks = UInt64(s.f_blocks)
+            let freeBlocks = UInt64(s.f_bfree)
+            let availBlocks = UInt64(s.f_bavail)
+            let totalKB = totalBlocks * blockSize / 1024
+            let usedKB = (totalBlocks - freeBlocks) * blockSize / 1024
+            let availKB = availBlocks * blockSize / 1024
+            let usePercent: UInt64
+            if totalBlocks > 0 {
+                usePercent = (totalBlocks - freeBlocks) * 100 / totalBlocks
+            } else {
+                usePercent = 0
+            }
+            let fsName = "isy-overlay"
+            output += String(format: "%-15s %8llu %8llu %8llu %3llu%% %s\n",
+                           fsName, totalKB, usedKB, availKB, usePercent, "/")
+        }
+
+        // 也显示 /tmp 和沙盒目录
+        var tmpStat = statvfs()
+        if statvfs("/tmp", &tmpStat) == 0 {
+            let blockSize = UInt64(tmpStat.f_frsize > 0 ? tmpStat.f_frsize : tmpStat.f_bsize)
+            let totalKB = UInt64(tmpStat.f_blocks) * blockSize / 1024
+            let usedKB = (UInt64(tmpStat.f_blocks) - UInt64(tmpStat.f_bfree)) * blockSize / 1024
+            let availKB = UInt64(tmpStat.f_bavail) * blockSize / 1024
+            let usePercent = UInt64(tmpStat.f_blocks) > 0
+                ? (UInt64(tmpStat.f_blocks) - UInt64(tmpStat.f_bfree)) * 100 / UInt64(tmpStat.f_blocks)
+                : 0
+            output += String(format: "%-15s %8llu %8llu %8llu %3llu%% %s\n",
+                           "tmpfs", totalKB, usedKB, availKB, usePercent, "/tmp")
+        }
+        return output
     }
 
     private func builtinDu(_ args: [String]) -> String {
@@ -806,7 +1012,8 @@ public final class BuiltinShell: @unchecked Sendable {
     }
 
     private func builtinSort(_ args: [String], input: String?) -> String {
-        let content = input ?? (args.first.map { readFile($0) } ?? readStdin())
+        let fileArgs = args.filter { !$0.hasPrefix("-") }
+        let content = input ?? (fileArgs.first.map { readFile($0) } ?? readStdin())
         let lines = content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let reverse = args.contains("-r")
         let numeric = args.contains("-n")
