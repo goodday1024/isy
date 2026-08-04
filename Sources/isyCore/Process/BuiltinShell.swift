@@ -936,7 +936,7 @@ public final class BuiltinShell: @unchecked Sendable {
                     if isIsy || pid <= 2 {
                         let tty = "?"
                         let time = "0:00"
-                        output += String(format: "%5d %-7s %-5c %6s %s\n", pid, tty, statChar, time, comm)
+                        output += String(format: "%5d %-7s %-5s %6s %s\n", pid, tty, String(statChar), time, comm)
                     }
                 }
             }
