@@ -2,7 +2,8 @@
 //
 // 渲染策略:
 //   - 使用 TerminalBuffer 的网格渲染, 支持 ANSI 颜色/粗体/斜体/下划线
-//   - 等宽字体 (SF Mono / Menlo)
+//   - 等宽字体 (SF Mono), 动态字号 (由设置页控制)
+//   - 整行 AttributedString 渲染 (而非逐字符 Text, 大幅提升性能)
 //   - 配色: 深色背景, ANSI 16/256 色
 //   - 输入区: 透明 TextField 覆盖在光标行, 配合 prompt 显示
 //   - 键盘: 支持 Cmd+Up/Down 历史导航, Ctrl+C/D 快捷键
@@ -16,11 +17,21 @@ public struct TerminalView: View {
     @ObservedObject var model: TerminalModel
     @FocusState private var inputFocused: Bool
     @State private var showToolbar: Bool = false
-    @State private var selectedText: String = ""
     @State private var showCopyConfirmation: Bool = false
 
-    public init(model: TerminalModel) {
+    public var fontSize: CGFloat
+
+    public init(model: TerminalModel, fontSize: CGFloat = 14) {
         self.model = model
+        self.fontSize = fontSize
+    }
+
+    private var terminalFont: Font {
+        .system(size: fontSize, weight: .regular, design: .monospaced)
+    }
+
+    private var lineHeight: CGFloat {
+        fontSize * 1.35
     }
 
     public var body: some View {
@@ -35,18 +46,18 @@ public struct TerminalView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(model.buffer.grid.enumerated()), id: \.offset) { rowIdx, row in
-                            attributedRowView(row: row, rowIdx: rowIdx)
+                            rowView(row: row, rowIdx: rowIdx)
                                 .id("row-\(rowIdx)")
                         }
                         // 当前输入行
                         HStack(spacing: 0) {
                             Text(model.prompt)
-                                .font(.system(.body, design: .monospaced))
+                                .font(terminalFont)
                                 .foregroundColor(.green)
                             TextField("", text: $model.currentInput)
                                 .focused($inputFocused)
                                 .textFieldStyle(.plain)
-                                .font(.system(.body, design: .monospaced))
+                                .font(terminalFont)
                                 .foregroundColor(.white)
                                 .autocorrectionDisabled()
                                 .textInputAutocapitalization(.never)
@@ -82,6 +93,7 @@ public struct TerminalView: View {
                         }
                         .id("input-line")
                         .padding(.horizontal, 8)
+                        .frame(height: lineHeight)
                     }
                     .padding(.vertical, 8)
                 }
@@ -186,33 +198,66 @@ public struct TerminalView: View {
         .foregroundColor(.gray)
     }
 
-    // MARK: - 带属性的行渲染
+    // MARK: - 整行渲染 (AttributedString)
 
-    private func attributedRowView(row: [TerminalCell], rowIdx: Int) -> some View {
-        let text = row.map { $0.char }
-        if text.allSatisfy({ $0 == " " }) {
-            // 空行
-            return AnyView(
-                Text(" ")
-                    .font(.system(.body, design: .monospaced))
-                    .frame(height: 18)
-            )
+    @ViewBuilder
+    private func rowView(row: [TerminalCell], rowIdx: Int) -> some View {
+        let attributed = buildAttributedLine(from: row)
+        if attributed.string.allSatisfy({ $0 == " " || $0 == "\0" }) {
+            // 空行: 占位
+            Color.clear
+                .frame(height: lineHeight)
+                .padding(.horizontal, 8)
+        } else {
+            Text(attributed)
+                .font(terminalFont)
+                .frame(height: lineHeight)
+                .padding(.horizontal, 8)
+                .textSelection(.enabled)
         }
-        return AnyView(
-            HStack(spacing: 0) {
-                ForEach(Array(row.enumerated()), id: \.offset) { colIdx, cell in
-                    Text(String(cell.char))
-                        .font(.system(.body, design: .monospaced))
-                        .fontWeight(cell.attrs.bold ? .bold : .regular)
-                        .italic(cell.attrs.italic)
-                        .underline(cell.attrs.underline)
-                        .strikethrough(cell.attrs.strikethrough)
-                        .foregroundColor(cell.attrs.fg)
-                        .background(cell.attrs.bg)
+    }
+
+    /// 将一行 TerminalCell 转换为 AttributedString
+    private func buildAttributedLine(from row: [TerminalCell]) -> AttributedString {
+        // 找到最后一个非空格字符, 截断尾部空格
+        var lastNonSpace = -1
+        for (i, cell) in row.enumerated() where cell.char != " " {
+            lastNonSpace = i
+        }
+        let endIdx = max(lastNonSpace + 1, 1)
+
+        var result = AttributedString()
+        for i in 0..<endIdx {
+            let cell = row[i]
+            var ch = AttributedString(String(cell.char))
+
+            // 前景色
+            if cell.attrs.inverse {
+                ch.foregroundColor = cell.attrs.bg == .clear ? Color.black : cell.attrs.bg
+                ch.backgroundColor = cell.attrs.fg
+            } else {
+                ch.foregroundColor = cell.attrs.fg
+                if cell.attrs.bg != .clear {
+                    ch.backgroundColor = cell.attrs.bg
                 }
             }
-            .textSelection(.enabled)
-        )
+
+            // 粗体
+            if cell.attrs.bold {
+                ch.font = .system(size: fontSize, weight: .bold, design: .monospaced)
+            }
+            // 斜体
+            if cell.attrs.italic {
+                ch.inlinePresentationIntent = .italic
+            }
+            // 下划线
+            if cell.attrs.underline {
+                ch.inlinePresentationIntent = (ch.inlinePresentationIntent ?? []).union(.lineThrough)
+            }
+
+            result += ch
+        }
+        return result
     }
 
     // MARK: - 复制/粘贴

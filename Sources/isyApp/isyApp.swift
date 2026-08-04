@@ -45,7 +45,7 @@ struct ContentView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 if let session = sessionManager.activeSession {
-                    TerminalView(model: session)
+                    TerminalView(model: session, fontSize: fontSize)
                         .overlay(alignment: .topTrailing) {
                             if !session.demoMode {
                                 statusBadge(session: session)
