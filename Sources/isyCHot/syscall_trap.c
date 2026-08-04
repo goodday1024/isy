@@ -88,10 +88,11 @@ uintptr_t isy_get_trap_address(void) {
 }
 
 // ---------- Apple 平台: .no_dead_strip 防止链接器 dead-strip ----------
+// 注意: Apple 汇编器语法为 .no_dead_strip _symbol_name, 不需要 $ 前缀
 #ifdef __APPLE__
-__asm__(".no_dead_strip $-___isy_syscall_trap");
-__asm__(".no_dead_strip $-___isy_c_syscall_dispatch");
-__asm__(".no_dead_strip $-___isy_anchor_sink");
+__asm__(".no_dead_strip ___isy_syscall_trap");
+__asm__(".no_dead_strip ___isy_c_syscall_dispatch");
+__asm__(".no_dead_strip ___isy_anchor_sink");
 #endif
 
 // ---------- 核心 naked syscall trap ----------
