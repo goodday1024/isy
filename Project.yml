@@ -44,11 +44,14 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources/isyApp
+      # 直接把 isyCHot 的 C 源文件加入 isyApp target, 绕过 SPM 的
+      # LTO 合并 (-r -object_path_lto 会消除 naked 函数引用的符号)
+      - path: Sources/isyCHot
+        excludes:
+          - "include"
     dependencies:
       - package: isy
         product: isyCore
-      - package: isy
-        product: isyCHot
       - package: isy
         product: isyUI
     settings:
@@ -58,10 +61,16 @@ targets:
         INFOPLIST_FILE: Sources/isyApp/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/Sources/isyCHot/include
         # 签名: CI 上用 ad-hoc 自签名 (iPhone Distribution 不可用)
         CODE_SIGN_IDENTITY: ""
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: NO
+        # 禁用 LTO: isyApp 直接编译 isyCHot 的 C 文件, 防止 naked 函数
+        # 引用的 __isy_c_syscall_dispatch 在 LTO 合并时被消除
+        LLVM_LTO: NO
+        GCC_OPTIMIZATION_LEVEL: "0"
         # 启用 W^X 合规: 不能开 JIT
         ENABLE_JIT: NO
         # 资源: rootfs 归档 (后续打包)

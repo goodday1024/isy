@@ -60,6 +60,16 @@ void isy_set_syscall_handler(isy_syscall_handler_t handler);
 // 返回: exit code (cpu->regs[0])
 int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base);
 
+// ---------- C 端 syscall dispatch (由 naked trap 调用) ----------
+// 声明为 extern "C" 公共符号, 供 trap 汇编 bl 引用.
+// 在 syscall_trap.c 中定义, 用 __attribute__((used)) 防 LTO 剥离.
+int64_t __isy_c_syscall_dispatch(
+    uint64_t a0, uint64_t a1, uint64_t a2,
+    uint64_t a3, uint64_t a4, uint64_t a5,
+    uint64_t syscall_nr,
+    isy_cpu_state_t *cpu
+);
+
 // ---------- 指令 trap 解释器 ----------
 // 对不能直通的 ARM64 指令进行解释 (MRS/MSR/BRK/DC/IC/AT 等)
 // 当 patcher 把这些指令替换为 BRK #imm 后, trap loop 会捕获并模拟
