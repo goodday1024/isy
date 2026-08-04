@@ -39,6 +39,12 @@ void __isy_syscall_trap(void);
 // 获取 __isy_syscall_trap 的绝对地址 (供 BinaryPatcher 计算 BL 偏移)
 uintptr_t isy_get_trap_address(void);
 
+// 运行时锚点函数: 被 Swift 端在初始化时显式调用,
+// 创建编译器可见的符号引用, 防止 Xcode archive LTO 时
+// naked 函数汇编中 bl 的目标符号被误消除.
+// 返回值等同于 isy_get_trap_address().
+uintptr_t isy_runtime_anchor(void);
+
 // C 端 syscall 分发回调, 由 syscall_trap 内部调用
 // 参数顺序遵循 AAPCS64: x0-x5 -> arg0-arg5, x8 -> syscall_nr
 // 返回值为 syscall 结果, 写回 x0

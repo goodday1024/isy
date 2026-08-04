@@ -30,6 +30,10 @@ public final class Emulator {
         self.process = LinuxProcess(pid: 1)
         self.dispatcher = SyscallDispatcher(process: process)
         self.dispatcher.registerCoreSyscalls(process: process)
+        // 调用 LTO 锚点: 在 IR 层面引用所有关键符号,
+        // 防止 Xcode archive 时 LTO 消除 naked 函数 bl 的目标符号.
+        // 返回值是 trap 地址, 与 isy_get_trap_address() 一致.
+        _ = isy_runtime_anchor()
     }
 
     /// 加载主程序 ELF

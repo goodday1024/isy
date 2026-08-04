@@ -6,20 +6,32 @@
 //      BL __isy_syscall_trap (相对跳转, 范围 ±128MB)
 //   3. Linux 代码作为函数指针被 isy_enter_linux 调用, 原生执行
 //   4. 遇到原 SVC 位置时, 实际执行 BL __isy_syscall_trap, 陷入本函数
-//   5. 本函数读取 x8 (syscall_nr) 与 x0-x5 (args), 通过函数指针间接
-//      调用 C dispatch (LTO 可见的引用方式)
+//   5. 本函数读取 x8 (syscall_nr) 与 x0-x5 (args), 调用 C dispatch
 //   6. dispatch 再回调 Swift SyscallDispatcher, 完成实际 syscall
 //   7. 返回值写入 x0, ret 回到 Linux 代码下一条指令
 //
-// LTO 兼容性:
-//   naked 函数内的 "bl symbol" 汇编引用, 在 LTO (SPM 对 C target 做
-//   -r -object_path_lto 预链接) 时不可见, 导致 symbol 被误消除.
-//   解决方案: 用 volatile 全局函数指针 + adrp/ldr/blr 间接调用,
-//   C 初始化代码对函数的取址是编译器可见的, LTO 不会消除.
+// 符号防消除策略 (针对 Xcode archive 时 SPM Clang target 的
+// -r -object_path_lto 预链接 LTO 问题):
+//   1. naked 函数内使用 bl 直接调用, 由汇编器产生正确重定位
+//   2. 被 bl 调用的函数标记为 __attribute__((used, noinline)) 且非 static
+//   3. isy_runtime_anchor() 被 Swift 显式调用, 在 IR 层面引用所有关键符号
+//      让 LTO 看到真实的 call graph 边
+//   4. Apple 平台额外使用 .no_dead_strip 防止链接器 dead-strip
+//   5. Package.swift 添加 -fno-lto 禁用 bitcode 生成
 
 #include "isy_hot.h"
 
-// 全局 handler, 由 Swift 端通过 isy_set_syscall_handler 注册
+// Apple AArch64: C 符号有额外下划线前缀; Linux ELF: 无
+#if defined(__APPLE__) && defined(__MACH__)
+#  define ISY_CSYM(name) _##name
+#  define ISY_ASM_BEGIN(name)
+#  define ISY_NO_DEAD_STRIP(name) __asm__(".no_dead_strip $-_" #name)
+#else
+#  define ISY_CSYM(name) name
+#  define ISY_NO_DEAD_STRIP(name)
+#endif
+
+// ---------- 全局状态 ----------
 static isy_syscall_handler_t g_handler = 0;
 
 void isy_set_syscall_handler(isy_syscall_handler_t handler) {
@@ -32,9 +44,13 @@ const isy_stats_t *isy_get_stats(void) { return &g_stats; }
 void isy_reset_stats(void) { g_stats.syscalls = g_stats.traps = g_stats.icache_flushes = 0; }
 
 // ---------- C 端 dispatch ----------
-// 注意: 签名必须与 isy_syscall_handler_t 完全一致 (7 个 uint64_t + isy_cpu_state_t*)
-__attribute__((noinline))
-static int64_t __isy_c_syscall_dispatch_impl(
+// 注意:
+//   - 非 static: 导出为全局符号, 让链接器看到
+//   - noinline: 防止被内联消除
+//   - used: 标记为"被使用", 即使编译器没看到显式调用
+//   - 签名与 isy_syscall_handler_t 一致: 7 uint64_t + isy_cpu_state_t*
+__attribute__((noinline, used, visibility("default")))
+int64_t __isy_c_syscall_dispatch(
     uint64_t a0, uint64_t a1, uint64_t a2,
     uint64_t a3, uint64_t a4, uint64_t a5,
     uint64_t syscall_nr,
@@ -48,34 +64,42 @@ static int64_t __isy_c_syscall_dispatch_impl(
     return g_handler(a0, a1, a2, a3, a4, a5, syscall_nr, 0);
 }
 
-// 函数指针类型 (与 isy_syscall_handler_t 一致)
-typedef int64_t (*isy_dispatch_fn_t)(
-    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
-    isy_cpu_state_t*
-);
+// ---------- LTO 锚点: 被 Swift 显式调用, IR 层面引用所有关键符号 ----------
+// 这个函数做三件事:
+//   1. 作为 Swift -> C 的显式调用点, 创建编译器可见的引用
+//   2. volatile 地读取关键符号地址, 防止 LTO 认为它们"未被使用"
+//   3. 返回 trap 地址给 Swift (供 BinaryPatcher 使用)
+volatile uintptr_t __isy_anchor_sink;  // volatile 全局, 防止优化掉
 
-// volatile 全局函数指针: 初始化时指向 dispatch 实现.
-// volatile + used 双重保证, 防止 LTO 将其和被指向的函数一起消除.
 __attribute__((used, visibility("default")))
-volatile isy_dispatch_fn_t __isy_dispatch_fn = __isy_c_syscall_dispatch_impl;
+uintptr_t isy_runtime_anchor(void) {
+    // volatile 写入: 编译器不能消除这些取值操作
+    __isy_anchor_sink = (uintptr_t)&__isy_c_syscall_dispatch;
+    __isy_anchor_sink = (uintptr_t)&isy_set_syscall_handler;
+    __isy_anchor_sink = (uintptr_t)&isy_enter_linux;
+    __isy_anchor_sink = (uintptr_t)&isy_get_stats;
+    // 返回 trap 地址
+    return (uintptr_t)&__isy_syscall_trap;
+}
 
 // 获取 trap 函数地址 (供 BinaryPatcher 计算 BL 偏移)
 uintptr_t isy_get_trap_address(void) {
     return (uintptr_t)&__isy_syscall_trap;
 }
 
-// 获取 dispatch 函数指针地址 (供 Swift 端验证, 不强制使用)
-uintptr_t isy_get_dispatch_fn_address(void) {
-    return (uintptr_t)&__isy_dispatch_fn;
-}
-
-#ifdef __aarch64__
+// ---------- Apple 平台: .no_dead_strip 防止链接器 dead-strip ----------
+#ifdef __APPLE__
+__asm__(".no_dead_strip $-___isy_syscall_trap");
+__asm__(".no_dead_strip $-___isy_c_syscall_dispatch");
+__asm__(".no_dead_strip $-___isy_anchor_sink");
+#endif
 
 // ---------- 核心 naked syscall trap ----------
+#ifdef __aarch64__
+
 // 协议: Linux ARM64 syscall: x8=nr, x0-x5=args, ret->x0
-// 步骤: 保存 callee-saved -> x8->x6 -> 通过函数指针间接调用 dispatch
-//       -> 恢复寄存器 -> ret
-__attribute__((naked))
+// 步骤: 保存 callee-saved -> x8->x6, x7=0 -> bl dispatch -> 恢复 -> ret
+__attribute__((naked, used))
 void __isy_syscall_trap(void) {
     __asm__ volatile(
         // 保存 callee-saved GPR (x19-x28, x29, x30)
@@ -86,7 +110,7 @@ void __isy_syscall_trap(void) {
         "stp x23, x24, [sp, #-16]!\n"
         "stp x25, x26, [sp, #-16]!\n"
         "stp x27, x28, [sp, #-16]!\n"
-        // 保存 NEON callee-saved (q8-q15 = d8-d15, 128 bytes)
+        // 保存 NEON callee-saved (q8-q15, 128 bytes)
         "sub sp, sp, #128\n"
         "stp q8, q9, [sp, #0]\n"
         "stp q10, q11, [sp, #32]\n"
@@ -98,12 +122,16 @@ void __isy_syscall_trap(void) {
         "mov x6, x8\n"
         "mov x7, #0\n"
 
-        // 通过全局函数指针间接调用 dispatch (LTO 安全):
-        // adrp + ldr 加载 __isy_dispatch_fn 的值到 x17 (IP1, caller-saved)
-        // blr x17 间接调用, 返回值在 x0
-        "adrp x17, __isy_dispatch_fn@PAGE\n"
-        "ldr x17, [x17, __isy_dispatch_fn@PAGEOFF]\n"
-        "blr x17\n"
+        // 直接 bl 调用 C dispatch 函数.
+        // 编译器/汇编器会为 bl 产生重定位条目,
+        // isy_runtime_anchor() 的显式引用确保 LTO 保留该符号.
+        // Apple Mach-O: C 符号有 _ 前缀, 所以 __isy_c_syscall_dispatch -> ___isy_c_syscall_dispatch
+        // Linux ELF: 无额外前缀, 直接用 __isy_c_syscall_dispatch
+#if defined(__APPLE__) && defined(__MACH__)
+        "bl ___isy_c_syscall_dispatch\n"
+#else
+        "bl __isy_c_syscall_dispatch\n"
+#endif
 
         // 恢复 NEON callee-saved
         "ldp q14, q15, [sp, #96]\n"

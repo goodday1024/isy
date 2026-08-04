@@ -31,6 +31,7 @@ guard args.count >= 2 else { printUsage(); exit(0) }
 
 switch args[1] {
 case "info":
+    _ = isy_runtime_anchor()  // LTO 锚点: 引用关键符号
     print("isy \(isyVersion)")
     print("  trap address: 0x\(String(isy_get_trap_address(), radix: 16))")
     let s = isy_get_stats().pointee
