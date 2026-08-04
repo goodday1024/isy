@@ -169,8 +169,8 @@ public final class TerminalModel: ObservableObject {
         }
     }
 
-    /// demo 模式 patcher 基准
-    private func runPatcherBenchDemo() -> Double {
+    /// demo 模式 patcher 基准 (nonisolated: 纯计算, 不访问 @Published 状态)
+    nonisolated private func runPatcherBenchDemo() -> Double {
         let count = 1_000_000
         var insns = [UInt32](repeating: 0xD503201F, count: count)
         for i in stride(from: 0, to: count, by: 100) { insns[i] = 0xD4000001 }
