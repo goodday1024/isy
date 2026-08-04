@@ -1,0 +1,158 @@
+name: build-ios-ipa
+
+# isy iOS App 构建 workflow
+# 触发: push 到 main / 手动 dispatch / 创建 release
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Package.swift'
+      - 'Project.yml'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  # ---------- 阶段 1: 跨平台核心库测试 (Linux) ----------
+  test-core:
+    name: Test isyCore (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+      - name: Build
+        run: swift build -c release
+      - name: Test
+        run: swift test --parallel
+      - name: Verify CLI
+        run: |
+          .build/release/isycli info
+          .build/release/isycli bench
+          .build/release/isycli syscall 172
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: .build/
+
+  # ---------- 阶段 2: iOS App 构建 (macOS) ----------
+  build-ios:
+    name: Build iOS ipa (macOS)
+    runs-on: macos-15
+    needs: test-core
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app/contents/Developer 2>/dev/null || true
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build archive (unsigned)
+        run: |
+          mkdir -p build
+          xcodebuild archive \
+            -project isy.xcodeproj \
+            -scheme isyApp \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/isy.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO
+
+      - name: Export unsigned ipa
+        run: |
+          mkdir -p build/export
+          cat > build/export/ExportOptions.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>development</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>stripSwiftSymbols</key>
+              <true/>
+              <key>teamID</key>
+              <string></string>
+              <key>compileBitcode</key>
+              <false/>
+              <key>thinning</key>
+              <string></string>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath build/isy.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist build/export/ExportOptions.plist \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO || true
+          # 如果 export 失败 (无签名), 用 zip 手动打 ipa
+          if [ ! -f build/export/isy.ipa ]; then
+            echo "exportArchive 失败 (无签名证书), 改用 zip 打包 Payload"
+            cd build
+            mkdir -p Payload
+            cp -r isy.xcarchive/Products/Applications/isy.app Payload/
+            zip -qry isy-unsigned.ipa Payload
+            cd ..
+            mv build/isy-unsigned.ipa build/export/isy-unsigned.ipa
+          fi
+          ls -la build/export/
+
+      - name: Upload ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: isy-ios-ipa
+          path: build/export/*.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload archive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isy-xcarchive
+          path: build/isy.xcarchive
+          retention-days: 7
+
+  # ---------- 阶段 3: Release (仅在 tag 时) ----------
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: build-ios
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download ipa
+        uses: actions/download-artifact@v4
+        with:
+          name: isy-ios-ipa
+          path: artifacts
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.ipa
+          generate_release_notes: true
+          draft: true

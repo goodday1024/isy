@@ -1,0 +1,44 @@
+# isy - iOS System
+# 跨平台 ARM64 Linux 用户态运行时, 近原生执行, 不违反 Apple 规则
+
+# Swift Package Manager
+.build/
+.swiftpm/
+.build/
+Packages/
+Package.pins
+Package.resolved
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# Xcode
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 测试产物
+Tests/*/__Snapshots__/
+coverage/
+
+# isy 运行时 (沙盒)
+rootfs/
+overlay/
+isy-sandbox/
+
+# 签名/证书 (永远不要提交)
+*.p12
+*.cer
+*.mobileprovision
+*.key
+secrets/
