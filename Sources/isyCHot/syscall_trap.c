@@ -37,7 +37,8 @@ void isy_reset_stats(void) { g_stats.syscalls = g_stats.traps = g_stats.icache_f
 
 // ---------- C 端 dispatch (由 naked trap 函数调用) ----------
 // 协议: x0-x5 已作为前 6 个参数, x8 通过 x6 传入 (见 trap 汇编)
-__attribute__((visibility("default")))
+// used: 防止 LTO/strip 优化掉 (naked __isy_syscall_trap 通过汇编 bl 引用)
+__attribute__((visibility("default"), used, noinline))
 int64_t __isy_c_syscall_dispatch(
     uint64_t a0, uint64_t a1, uint64_t a2,
     uint64_t a3, uint64_t a4, uint64_t a5,

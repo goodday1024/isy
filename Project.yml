@@ -23,6 +23,10 @@ settings:
     CLANG_ENABLE_MODULES: YES
     SWIFT_OBJC_BRIDGING_HEADER: ""
     OTHER_LDFLAGS: "-ObjC"
+    # 禁用 LTO: 避免 naked 函数引用的 C 符号在 release 优化时被剥离
+    LLVM_LTO: NO
+    SWIFT_OPTIMIZATION_LEVEL: "-O"
+    GCC_OPTIMIZATION_LEVEL: "s"
     # 允许 isyCore 的 C target (isyCHot) 链接
     SWIFT_PACKAGE_MANAGER_BUILDS: YES
 
