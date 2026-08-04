@@ -1,16 +1,10 @@
-# isy - iOS System
-# Xcode 工程生成配置 (用 xcodegen 生成 .xcodeproj)
-#
-# 生成方式: xcodegen generate
-# 这会基于本文件 + Package.swift 生成 isy.xcodeproj
-
 name: isy
 options:
   bundleIdPrefix: app.isy
   deploymentTarget:
     iOS: "17.0"
   createIntermediateGroups: true
-  developmentLanguage: zh-Hans
+  generateEmptyDirectories: false
 
 settings:
   base:
@@ -21,21 +15,11 @@ settings:
     SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
     GCC_TREAT_WARNINGS_AS_ERRORS: NO
     CLANG_ENABLE_MODULES: YES
-    SWIFT_OBJC_BRIDGING_HEADER: ""
     OTHER_LDFLAGS: "-ObjC"
-    # 禁用 LTO: 避免 naked 函数引用的 C 符号在 release 优化时被剥离
-    LLVM_LTO: NO
-    SWIFT_OPTIMIZATION_LEVEL: "-O"
-    GCC_OPTIMIZATION_LEVEL: "s"
-    # 强制加载 isyCHot 所有 .o (naked 函数通过汇编 bl 引用的符号
-    # 在 LTO/静态库链接时可能被丢弃)
-    OTHER_LDFLAGS: "-ObjC -all_load"
-    # 允许 isyCore 的 C target (isyCHot) 链接
-    SWIFT_PACKAGE_MANAGER_BUILDS: YES
-
-packages:
-  isy:
-    path: .
+    ENABLE_JIT: NO
+    # 保留调试信息, 方便排查
+    GCC_GENERATE_DEBUGGING_SYMBOLS: YES
+    DEBUG_INFORMATION_FORMAT: "dwarf-with-dsym"
 
 targets:
   isyApp:
@@ -44,11 +28,6 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources/isyApp
-      # 直接把 isyCHot 的 C 源文件加入 isyApp target, 绕过 SPM 的
-      # LTO 合并 (-r -object_path_lto 会消除 naked 函数引用的符号)
-      - path: Sources/isyCHot
-        excludes:
-          - "include"
     dependencies:
       - package: isy
         product: isyCore
@@ -61,20 +40,18 @@ targets:
         INFOPLIST_FILE: Sources/isyApp/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
-        HEADER_SEARCH_PATHS:
-          - $(SRCROOT)/Sources/isyCHot/include
-        # 签名: CI 上用 ad-hoc 自签名 (iPhone Distribution 不可用)
         CODE_SIGN_IDENTITY: ""
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: NO
-        # 禁用 LTO: isyApp 直接编译 isyCHot 的 C 文件, 防止 naked 函数
-        # 引用的 __isy_c_syscall_dispatch 在 LTO 合并时被消除
+        DEVELOPMENT_TEAM: ""
+        # Release 模式禁用 LTO, 避免 C naked 函数符号被消除
         LLVM_LTO: NO
         GCC_OPTIMIZATION_LEVEL: "0"
-        # 启用 W^X 合规: 不能开 JIT
-        ENABLE_JIT: NO
-        # 资源: rootfs 归档 (后续打包)
-        # COPY_PHASE_STRIP: NO
+        SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+
+packages:
+  isy:
+    path: .
 
 schemes:
   isyApp:

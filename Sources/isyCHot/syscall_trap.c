@@ -6,15 +6,16 @@
 //      BL __isy_syscall_trap (相对跳转, 范围 ±128MB)
 //   3. Linux 代码作为函数指针被 isy_enter_linux 调用, 原生执行
 //   4. 遇到原 SVC 位置时, 实际执行 BL __isy_syscall_trap, 陷入本函数
-//   5. 本函数读取 x8 (syscall_nr) 与 x0-x5 (args), 调用 C dispatch
+//   5. 本函数读取 x8 (syscall_nr) 与 x0-x5 (args), 通过函数指针间接
+//      调用 C dispatch (LTO 可见的引用方式)
 //   6. dispatch 再回调 Swift SyscallDispatcher, 完成实际 syscall
 //   7. 返回值写入 x0, ret 回到 Linux 代码下一条指令
 //
-// 这就是 "近原生" 路径: 99.99% 指令直接跑在 ARM64 CPU 上, 只有 syscall
-// 边界陷入翻译层. 不写可执行页 (只改 SVC 那 4 字节为 BL), 完全合规.
-//
-// 注意: BL 范围 ±128MB. 为保证可达, isy 加载 Linux 代码到与 isyCHot
-// 同一映像附近的固定区域 (见 Memory.swift: ISY_LINUX_BASE).
+// LTO 兼容性:
+//   naked 函数内的 "bl symbol" 汇编引用, 在 LTO (SPM 对 C target 做
+//   -r -object_path_lto 预链接) 时不可见, 导致 symbol 被误消除.
+//   解决方案: 用 volatile 全局函数指针 + adrp/ldr/blr 间接调用,
+//   C 初始化代码对函数的取址是编译器可见的, LTO 不会消除.
 
 #include "isy_hot.h"
 
@@ -25,52 +26,59 @@ void isy_set_syscall_handler(isy_syscall_handler_t handler) {
     g_handler = handler;
 }
 
-// 获取 trap 函数地址 (供 BinaryPatcher 计算 BL 偏移)
-uintptr_t isy_get_trap_address(void) {
-    return (uintptr_t)&__isy_syscall_trap;
-}
-
-// stats: 非 static, 供 trap_dispatch.c 累加 traps 计数
+// stats
 isy_stats_t g_stats = {0, 0, 0};
 const isy_stats_t *isy_get_stats(void) { return &g_stats; }
 void isy_reset_stats(void) { g_stats.syscalls = g_stats.traps = g_stats.icache_flushes = 0; }
 
-// ---------- C 端 dispatch (由 naked trap 函数调用) ----------
-// 协议: x0-x5 已作为前 6 个参数, x8 通过 x6 传入 (见 trap 汇编)
-// used + 保留指针引用: 防止 LTO 在合并 .o 时消除 (naked 函数的汇编 bl 引用
-// 在 LTO 视角下不可见, 需要一个 C 层面的可见引用)
-__attribute__((visibility("default"), used, noinline))
-int64_t __isy_c_syscall_dispatch(
+// ---------- C 端 dispatch ----------
+// 注意: 签名必须与 isy_syscall_handler_t 完全一致 (7 个 uint64_t + isy_cpu_state_t*)
+__attribute__((noinline))
+static int64_t __isy_c_syscall_dispatch_impl(
     uint64_t a0, uint64_t a1, uint64_t a2,
     uint64_t a3, uint64_t a4, uint64_t a5,
     uint64_t syscall_nr,
     isy_cpu_state_t *cpu
 ) {
+    (void)cpu;
     g_stats.syscalls++;
     if (__builtin_expect(g_handler == 0, 0)) {
-        // 未注册 handler, 返回 -ENOSYS
-        return -38;
+        return -38; // -ENOSYS
     }
-    return g_handler(a0, a1, a2, a3, a4, a5, syscall_nr, cpu);
+    return g_handler(a0, a1, a2, a3, a4, a5, syscall_nr, 0);
 }
 
-// LTO 保留锚点: 取函数地址存入 volatile 全局变量, 让编译器在 LTO
-// 合并阶段仍认为此符号有外部引用, 不会被消除
-__attribute__((used))
-volatile uintptr_t __isy_dispatch_anchor = (uintptr_t)&__isy_c_syscall_dispatch;
+// 函数指针类型 (与 isy_syscall_handler_t 一致)
+typedef int64_t (*isy_dispatch_fn_t)(
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    isy_cpu_state_t*
+);
+
+// volatile 全局函数指针: 初始化时指向 dispatch 实现.
+// volatile + used 双重保证, 防止 LTO 将其和被指向的函数一起消除.
+__attribute__((used, visibility("default")))
+volatile isy_dispatch_fn_t __isy_dispatch_fn = __isy_c_syscall_dispatch_impl;
+
+// 获取 trap 函数地址 (供 BinaryPatcher 计算 BL 偏移)
+uintptr_t isy_get_trap_address(void) {
+    return (uintptr_t)&__isy_syscall_trap;
+}
+
+// 获取 dispatch 函数指针地址 (供 Swift 端验证, 不强制使用)
+uintptr_t isy_get_dispatch_fn_address(void) {
+    return (uintptr_t)&__isy_dispatch_fn;
+}
 
 #ifdef __aarch64__
 
 // ---------- 核心 naked syscall trap ----------
-// 协议对照:
-//   Linux ARM64 syscall: x8=nr, x0-x5=args, ret->x0
-//   AAPCS64 函数调用:   x0-x7=args, ret->x0
-// 我们只需把 x8 移到一个参数寄存器位 (x6/x7), 然后调用 C dispatch
-__attribute__((naked, section("__TEXT,__isytrap")))
+// 协议: Linux ARM64 syscall: x8=nr, x0-x5=args, ret->x0
+// 步骤: 保存 callee-saved -> x8->x6 -> 通过函数指针间接调用 dispatch
+//       -> 恢复寄存器 -> ret
+__attribute__((naked))
 void __isy_syscall_trap(void) {
     __asm__ volatile(
-        // 保存调用者寄存器 (Linux 代码的 callee-saved 视角)
-        // x19-x28, x29(fp), x30(lr), sp, q8-q15 (NEON callee-saved)
+        // 保存 callee-saved GPR (x19-x28, x29, x30)
         "stp x29, x30, [sp, #-16]!\n"
         "mov x29, sp\n"
         "stp x19, x20, [sp, #-16]!\n"
@@ -78,29 +86,32 @@ void __isy_syscall_trap(void) {
         "stp x23, x24, [sp, #-16]!\n"
         "stp x25, x26, [sp, #-16]!\n"
         "stp x27, x28, [sp, #-16]!\n"
-        "sub sp, sp, #144\n"
+        // 保存 NEON callee-saved (q8-q15 = d8-d15, 128 bytes)
+        "sub sp, sp, #128\n"
         "stp q8, q9, [sp, #0]\n"
         "stp q10, q11, [sp, #32]\n"
         "stp q12, q13, [sp, #64]\n"
         "stp q14, q15, [sp, #96]\n"
 
-        // 把 x8 (syscall_nr) 移到 x6 作为第 7 个参数
-        // x0-x5 已是前 6 个参数
+        // x8 (syscall_nr) -> x6 (第 7 个参数)
+        // x7 -> 0 (NULL cpu 指针, 第 8 个参数)
         "mov x6, x8\n"
+        "mov x7, #0\n"
 
-        // 把当前 sp 也传给 C 端 (作为 cpu 指针的来源参考, 实际由
-        // isy_enter_linux 维护一个 per-thread 的 cpu 指针, 见下)
-        "mov x7, sp\n"
+        // 通过全局函数指针间接调用 dispatch (LTO 安全):
+        // adrp + ldr 加载 __isy_dispatch_fn 的值到 x17 (IP1, caller-saved)
+        // blr x17 间接调用, 返回值在 x0
+        "adrp x17, __isy_dispatch_fn@PAGE\n"
+        "ldr x17, [x17, __isy_dispatch_fn@PAGEOFF]\n"
+        "blr x17\n"
 
-        // 调用 C dispatch
-        "bl __isy_c_syscall_dispatch\n"
-
-        // 返回值已在 x0, 恢复寄存器
+        // 恢复 NEON callee-saved
         "ldp q14, q15, [sp, #96]\n"
         "ldp q12, q13, [sp, #64]\n"
         "ldp q10, q11, [sp, #32]\n"
         "ldp q8, q9, [sp, #0]\n"
-        "add sp, sp, #144\n"
+        "add sp, sp, #128\n"
+        // 恢复 callee-saved GPR
         "ldp x27, x28, [sp], #16\n"
         "ldp x25, x26, [sp], #16\n"
         "ldp x23, x24, [sp], #16\n"
@@ -112,13 +123,8 @@ void __isy_syscall_trap(void) {
 }
 
 // ---------- 执行入口 ----------
-// 进入 Linux 代码. entry 是 patch 后的 Linux 函数地址.
-// 我们设置 x0=argc, x1=argv, x2=envp, x3=auxv, sp=stack_top
-// 然后用 BR x16 跳转. 返回时 (Linux 调 exit syscall) 由 Swift 端 longjmp 退出.
 int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base) {
     (void)stack_base;
-    // 把 cpu 状态加载到寄存器 (argc/argv/envp/auxv 等)
-    // 简化: 只设置 sp 和 x0 (argc). 完整实现见 Memory.swift 设置栈布局
     register uint64_t x0 asm("x0") = cpu->regs[0];
     register uint64_t x1 asm("x1") = cpu->regs[1];
     register uint64_t x2 asm("x2") = cpu->regs[2];
@@ -128,32 +134,25 @@ int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base) {
     register uintptr_t x16 asm("x16") = entry;
     register uint64_t sp asm("sp") = cpu->sp;
 
-    // 设置 TPIDR_EL0 (Linux TLS pointer)
-    // 注意: 这会覆盖 iOS 自身的 TLS! 需要在 syscall trap 里 save/restore
-    // 见 arm64_helpers.c 的 isy_tls_swap
     __asm__ volatile(
         "msr tpidr_el0, %x[tls]\n"
         "br x16\n"
         :
-        : [tls] "r"(cpu->regs[18]),   // 约定: regs[18] = TLS pointer
+        : [tls] "r"(cpu->regs[18]),
           "r"(x0), "r"(x1), "r"(x2), "r"(x3),
           "r"(x4), "r"(x5), "r"(x16), "r"(sp)
         : "memory"
     );
-    // 不会到这里 (Linux 代码通过 exit syscall 退出)
     return (int)cpu->regs[0];
 }
 
 #else // !__aarch64__
 
-// 非 arm64 平台的 stub (永远不会真正执行, 仅保证可编译)
-void __isy_syscall_trap(void) {
-    // unreachable: 仅用于让链接器有符号
-}
+void __isy_syscall_trap(void) { }
 
 int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base) {
     (void)entry; (void)cpu; (void)stack_base;
-    return -1;  // 平台不支持
+    return -1;
 }
 
 #endif // __aarch64__
