@@ -195,10 +195,12 @@ public final class DynamicLinker {
             let off = start + i * entrySize
             guard off + 16 <= data.count else { break }
             func u64(_ o: Int) -> UInt64 {
-                UInt64(data[o]) | (UInt64(data[o+1]) << 8) |
-                (UInt64(data[o+2]) << 16) | (UInt64(data[o+3]) << 24) |
-                (UInt64(data[o+4]) << 32) | (UInt64(data[o+5]) << 40) |
-                (UInt64(data[o+6]) << 48) | (UInt64(data[o+7]) << 56)
+                // 拆分为两段避免 release 模式类型推断超时
+                let lo: UInt64 = UInt64(data[o]) | (UInt64(data[o+1]) << 8) |
+                                 (UInt64(data[o+2]) << 16) | (UInt64(data[o+3]) << 24)
+                let hi: UInt64 = UInt64(data[o+4]) | (UInt64(data[o+5]) << 8) |
+                                 (UInt64(data[o+6]) << 16) | (UInt64(data[o+7]) << 24)
+                return lo | (hi << 32)
             }
             let tag = Int64(bitPattern: u64(off))
             let val = u64(off + 8)

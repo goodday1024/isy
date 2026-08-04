@@ -139,10 +139,12 @@ public struct ELFParser {
             (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
         }
         func u64(_ off: Int) -> UInt64 {
-            UInt64(data[off]) | (UInt64(data[off+1]) << 8) |
-            (UInt64(data[off+2]) << 16) | (UInt64(data[off+3]) << 24) |
-            (UInt64(data[off+4]) << 32) | (UInt64(data[off+5]) << 40) |
-            (UInt64(data[off+6]) << 48) | (UInt64(data[off+7]) << 56)
+            // 拆分为两段避免 release 模式类型推断超时
+            let lo: UInt64 = UInt64(data[off]) | (UInt64(data[off+1]) << 8) |
+                             (UInt64(data[off+2]) << 16) | (UInt64(data[off+3]) << 24)
+            let hi: UInt64 = UInt64(data[off+4]) | (UInt64(data[off+5]) << 8) |
+                             (UInt64(data[off+6]) << 16) | (UInt64(data[off+7]) << 24)
+            return lo | (hi << 32)
         }
         var ident = [UInt8](repeating: 0, count: 16)
         for i in 0..<16 { ident[i] = data[i] }
@@ -172,10 +174,12 @@ public struct ELFParser {
                 (UInt32(data[off+o+2]) << 16) | (UInt32(data[off+o+3]) << 24)
             }
             func u64(_ o: Int) -> UInt64 {
-                UInt64(data[off+o]) | (UInt64(data[off+o+1]) << 8) |
-                (UInt64(data[off+o+2]) << 16) | (UInt64(data[off+o+3]) << 24) |
-                (UInt64(data[off+o+4]) << 32) | (UInt64(data[off+o+5]) << 40) |
-                (UInt64(data[off+o+6]) << 48) | (UInt64(data[off+o+7]) << 56)
+                // 拆分为两段避免 release 模式类型推断超时
+                let lo: UInt64 = UInt64(data[off+o]) | (UInt64(data[off+o+1]) << 8) |
+                                 (UInt64(data[off+o+2]) << 16) | (UInt64(data[off+o+3]) << 24)
+                let hi: UInt64 = UInt64(data[off+o+4]) | (UInt64(data[off+o+5]) << 8) |
+                                 (UInt64(data[off+o+6]) << 16) | (UInt64(data[off+o+7]) << 24)
+                return lo | (hi << 32)
             }
             result.append(ELF64ProgramHeader(
                 type: u32(0), flags: u32(4),
