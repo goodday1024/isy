@@ -46,16 +46,21 @@ jobs:
   # ---------- 阶段 2: iOS App 构建 (macOS) ----------
   build-ios:
     name: Build iOS ipa (macOS)
-    runs-on: macos-15
+    runs-on: macos-14
     needs: test-core
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select Xcode
+      - name: Select Xcode & list SDKs
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.2.app/contents/Developer 2>/dev/null || true
+          # 选取最新可用 Xcode
+          ls /Applications | grep -i xcode
+          DEFAULT_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "Using: $DEFAULT_XCODE"
+          sudo xcode-select -s "$DEFAULT_XCODE/Contents/Developer"
           xcodebuild -version
-          xcodebuild -showsdks | grep -i ios
+          echo "--- Available iOS SDKs ---"
+          xcodebuild -showsdks | grep -i ios || true
 
       - name: Install xcodegen
         run: brew install xcodegen
@@ -63,14 +68,22 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
+      - name: Resolve iOS SDK
+        id: sdk
+        run: |
+          SDK=$(xcodebuild -showsdks | grep -oE 'iphoneos[0-9.]+' | sort -V | tail -1)
+          echo "Resolved SDK: $SDK"
+          echo "sdk=$SDK" >> $GITHUB_OUTPUT
+
       - name: Build archive (unsigned)
         run: |
           mkdir -p build
+          # 用 -sdk 替代 -destination, 避免 "iOS X.X is not installed" 平台缺失问题
           xcodebuild archive \
             -project isy.xcodeproj \
             -scheme isyApp \
             -configuration Release \
-            -destination "generic/platform=iOS" \
+            -sdk ${{ steps.sdk.outputs.sdk }} \
             -archivePath build/isy.xcarchive \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
@@ -78,7 +91,8 @@ jobs:
             CODE_SIGN_ENTITLEMENTS="" \
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=NO
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64
 
       - name: Export unsigned ipa
         run: |
