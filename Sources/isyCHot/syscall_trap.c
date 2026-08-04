@@ -56,12 +56,12 @@ int64_t __isy_c_syscall_dispatch(
     uint64_t syscall_nr,
     isy_cpu_state_t *cpu
 ) {
-    (void)cpu;
     g_stats.syscalls++;
     if (__builtin_expect(g_handler == 0, 0)) {
         return -38; // -ENOSYS
     }
-    return g_handler(a0, a1, a2, a3, a4, a5, syscall_nr, 0);
+    // 传递 cpu 指针到 handler
+    return g_handler(a0, a1, a2, a3, a4, a5, syscall_nr, cpu);
 }
 
 // ---------- LTO 锚点: 被 Swift 显式调用, IR 层面引用所有关键符号 ----------
@@ -78,6 +78,7 @@ uintptr_t isy_runtime_anchor(void) {
     __isy_anchor_sink = (uintptr_t)&isy_set_syscall_handler;
     __isy_anchor_sink = (uintptr_t)&isy_enter_linux;
     __isy_anchor_sink = (uintptr_t)&isy_get_stats;
+    __isy_anchor_sink = (uintptr_t)&isy_request_exit;
     // 返回 trap 地址
     return (uintptr_t)&__isy_syscall_trap;
 }
@@ -93,67 +94,126 @@ uintptr_t isy_get_trap_address(void) {
 __asm__(".no_dead_strip ___isy_syscall_trap");
 __asm__(".no_dead_strip ___isy_c_syscall_dispatch");
 __asm__(".no_dead_strip ___isy_anchor_sink");
+__asm__(".no_dead_strip ___isy_request_exit");
 #endif
 
 // ---------- 核心 naked syscall trap ----------
 #ifdef __aarch64__
 
 // 协议: Linux ARM64 syscall: x8=nr, x0-x5=args, ret->x0
-// 步骤: 保存 callee-saved -> x8->x6, x7=0 -> bl dispatch -> 恢复 -> ret
+// 新实现: 构造 isy_cpu_state_t 在栈上, 保存完整寄存器上下文,
+// 传递给 dispatch 函数, 从修改后的 CPU 状态恢复 (支持信号重定向).
+// 步骤:
+//   1. 分配 288 字节栈空间 (isy_cpu_state_t = 36*8 字节)
+//   2. 保存 x0-x30 到 cpu->regs[0..30]
+//   3. 保存 sp, pc(lr), pstate, syscall_nr 到 cpu 结构
+//   4. x6=syscall_nr, x7=cpu 指针 -> 调用 dispatch
+//   5. 从 cpu 结构恢复 x0-x30, sp, pc, pstate
+//   6. 返回 (如果信号处理修改了 pc/sp, 则跳转到信号处理函数)
 __attribute__((naked, used))
 void __isy_syscall_trap(void) {
     __asm__ volatile(
-        // 保存 callee-saved GPR (x19-x28, x29, x30)
-        "stp x29, x30, [sp, #-16]!\n"
-        "mov x29, sp\n"
-        "stp x19, x20, [sp, #-16]!\n"
-        "stp x21, x22, [sp, #-16]!\n"
-        "stp x23, x24, [sp, #-16]!\n"
-        "stp x25, x26, [sp, #-16]!\n"
-        "stp x27, x28, [sp, #-16]!\n"
-        // 保存 NEON callee-saved (q8-q15, 128 bytes)
-        "sub sp, sp, #128\n"
-        "stp q8, q9, [sp, #0]\n"
-        "stp q10, q11, [sp, #32]\n"
-        "stp q12, q13, [sp, #64]\n"
-        "stp q14, q15, [sp, #96]\n"
+        // 步骤 1: 分配 CPU state 空间 (36*8 = 288 字节, 对齐到 16)
+        "sub sp, sp, #304\n"  // 288 + 16 对齐
 
-        // x8 (syscall_nr) -> x6 (第 7 个参数)
-        // x7 -> 0 (NULL cpu 指针, 第 8 个参数)
-        "mov x6, x8\n"
-        "mov x7, #0\n"
+        // 步骤 2: 保存 x0-x30 到 cpu->regs[0..30]
+        "stp x0, x1, [sp, #0]\n"
+        "stp x2, x3, [sp, #16]\n"
+        "stp x4, x5, [sp, #32]\n"
+        "stp x6, x7, [sp, #48]\n"
+        "stp x8, x9, [sp, #64]\n"
+        "stp x10, x11, [sp, #80]\n"
+        "stp x12, x13, [sp, #96]\n"
+        "stp x14, x15, [sp, #112]\n"
+        "stp x16, x17, [sp, #128]\n"
+        "stp x18, x19, [sp, #144]\n"
+        "stp x20, x21, [sp, #160]\n"
+        "stp x22, x23, [sp, #176]\n"
+        "stp x24, x25, [sp, #192]\n"
+        "stp x26, x27, [sp, #208]\n"
+        "stp x28, x29, [sp, #224]\n"
+        "str x30, [sp, #240]\n"       // lr -> regs[30]
 
-        // 直接 bl 调用 C dispatch 函数.
-        // 编译器/汇编器会为 bl 产生重定位条目,
-        // isy_runtime_anchor() 的显式引用确保 LTO 保留该符号.
-        // Apple Mach-O: C 符号有 _ 前缀, 所以 __isy_c_syscall_dispatch -> ___isy_c_syscall_dispatch
-        // Linux ELF: 无额外前缀, 直接用 __isy_c_syscall_dispatch
+        // 步骤 3: 保存 sp, pc, pstate, syscall_nr
+        // 计算原始 sp (在分配 304 字节之前) = 当前 sp + 304
+        "add x9, sp, #304\n"
+        "str x9, [sp, #248]\n"         // cpu->sp = 原始 sp
+        "str x30, [sp, #256]\n"        // cpu->pc = lr (返回地址)
+        "mrs x9, NZCV\n"
+        "str x9, [sp, #264]\n"         // cpu->pstate = NZCV
+        "str x8, [sp, #272]\n"         // cpu->syscall_nr = x8
+
+        // 步骤 4: 准备参数并调用 dispatch
+        // x0-x5 已经是 args; x6 = syscall_nr; x7 = cpu 指针
+        "mov x6, x8\n"                 // x6 = syscall_nr
+        "mov x7, sp\n"                 // x7 = &cpu_state
+
+        // 直接 bl 调用 C dispatch 函数
 #if defined(__APPLE__) && defined(__MACH__)
         "bl ___isy_c_syscall_dispatch\n"
 #else
         "bl __isy_c_syscall_dispatch\n"
 #endif
 
-        // 恢复 NEON callee-saved
-        "ldp q14, q15, [sp, #96]\n"
-        "ldp q12, q13, [sp, #64]\n"
-        "ldp q10, q11, [sp, #32]\n"
-        "ldp q8, q9, [sp, #0]\n"
-        "add sp, sp, #128\n"
-        // 恢复 callee-saved GPR
-        "ldp x27, x28, [sp], #16\n"
-        "ldp x25, x26, [sp], #16\n"
-        "ldp x23, x24, [sp], #16\n"
-        "ldp x21, x22, [sp], #16\n"
-        "ldp x19, x20, [sp], #16\n"
-        "ldp x29, x30, [sp], #16\n"
+        // 步骤 5: 从 cpu 结构恢复寄存器 (可能被信号处理修改)
+        "ldp x0, x1, [sp, #0]\n"
+        "ldp x2, x3, [sp, #16]\n"
+        "ldp x4, x5, [sp, #32]\n"
+        // x6, x7 不需要恢复 (由 dispatch 使用)
+        "ldp x8, x9, [sp, #64]\n"
+        "ldp x10, x11, [sp, #80]\n"
+        "ldp x12, x13, [sp, #96]\n"
+        "ldp x14, x15, [sp, #112]\n"
+        "ldp x16, x17, [sp, #128]\n"
+        "ldp x18, x19, [sp, #144]\n"
+        "ldp x20, x21, [sp, #160]\n"
+        "ldp x22, x23, [sp, #176]\n"
+        "ldp x24, x25, [sp, #192]\n"
+        "ldp x26, x27, [sp, #208]\n"
+        "ldp x28, x29, [sp, #224]\n"
+        "ldr x30, [sp, #240]\n"       // 恢复 lr
+
+        // 检查 pc 是否被修改 (信号处理会设置 pc 为信号处理函数地址)
+        "ldr x9, [sp, #256]\n"        // 读取 cpu->pc
+        "cmp x9, x30\n"               // 比较 pc 和 lr
+        "b.eq 0f\n"                   // 如果相同, 正常返回
+        // pc 被修改: 跳转到信号处理函数
+        "mov x30, x9\n"               // 设置 lr = 新 pc (信号处理函数)
+
+        "0:\n"
+        // 恢复 sp 并返回
+        "add sp, sp, #304\n"
         "ret\n"
     );
 }
 
+// ---------- iOS 上下文保存 (用于 isy_request_exit 恢复) ----------
+// 在进入 Linux 代码前保存 iOS 的栈指针和帧指针,
+// isy_request_exit 用它们恢复上下文并返回到 isy_enter_linux 的调用者.
+static uint64_t g_isy_saved_ios_sp = 0;
+static uint64_t g_isy_saved_ios_fp = 0;
+static uint64_t g_isy_saved_ios_lr = 0;
+static int      g_isy_exit_code = 0;
+
 // ---------- 执行入口 ----------
+// 进入 Linux 代码执行. 使用 blr x16 调用入口, 以便 Linux exit 后能返回.
+// 当 Linux 进程调用 exit syscall 时, isy_request_exit 恢复 iOS 上下文
+// 并跳转回本函数的返回点 (即 g_isy_saved_ios_lr).
 int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base) {
     (void)stack_base;
+    g_isy_exit_code = 0;
+
+    // 保存 iOS 上下文 (在进入 Linux 栈之前)
+    __asm__ volatile(
+        "mov %0, sp\n"
+        "mov %1, x29\n"
+        "mov %2, x30\n"
+        : "=r"(g_isy_saved_ios_sp),
+          "=r"(g_isy_saved_ios_fp),
+          "=r"(g_isy_saved_ios_lr)
+    );
+
+    // 设置 Linux 寄存器
     register uint64_t x0 asm("x0") = cpu->regs[0];
     register uint64_t x1 asm("x1") = cpu->regs[1];
     register uint64_t x2 asm("x2") = cpu->regs[2];
@@ -163,16 +223,45 @@ int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base) {
     register uintptr_t x16 asm("x16") = entry;
     register uint64_t sp asm("sp") = cpu->sp;
 
+    // 跳转到 Linux 代码 (blr 设置 lr 为返回地址)
     __asm__ volatile(
         "msr tpidr_el0, %x[tls]\n"
-        "br x16\n"
-        :
+        "blr x16\n"
+        // 从 Linux 代码返回 (通过 isy_request_exit 恢复的上下文)
+        "mov %[ret], x0\n"
+        : [ret] "=r"(g_isy_exit_code)
         : [tls] "r"(cpu->regs[18]),
           "r"(x0), "r"(x1), "r"(x2), "r"(x3),
           "r"(x4), "r"(x5), "r"(x16), "r"(sp)
+        : "memory", "x0"
+    );
+
+    return g_isy_exit_code;
+}
+
+// ---------- 请求退出 ----------
+// 由 exit/exit_group syscall handler 调用.
+// 恢复 iOS 上下文并返回到 isy_enter_linux 的调用者.
+// 此函数不返回 (noreturn).
+__attribute__((naked, used))
+void isy_request_exit(int code) {
+    (void)code;
+    __asm__ volatile(
+        // 恢复 iOS 栈指针和帧指针
+        "mov sp, %[ios_sp]\n"
+        "mov x29, %[ios_fp]\n"
+        // 把退出码写入 x0
+        "mov x0, %[exit_code]\n"
+        // 跳回 isy_enter_linux 的调用者
+        "ret %[ios_lr]\n"
+        :
+        : [ios_sp] "r"(g_isy_saved_ios_sp),
+          [ios_fp] "r"(g_isy_saved_ios_fp),
+          [ios_lr] "r"(g_isy_saved_ios_lr),
+          [exit_code] "r"((uint64_t)(int64_t)code)
         : "memory"
     );
-    return (int)cpu->regs[0];
+    __builtin_unreachable();
 }
 
 #else // !__aarch64__
@@ -182,6 +271,11 @@ void __isy_syscall_trap(void) { }
 int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base) {
     (void)entry; (void)cpu; (void)stack_base;
     return -1;
+}
+
+void isy_request_exit(int code) {
+    (void)code;
+    // 非 arm64 平台: 什么都不做 (永远不会被调用)
 }
 
 #endif // __aarch64__

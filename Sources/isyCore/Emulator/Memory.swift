@@ -56,7 +56,7 @@ public enum MemoryError: Error {
 /// Linux 进程地址空间
 public final class LinuxAddressSpace {
     /// 已分配的内存区域 (按 vaBase 排序)
-    public private(set) var regions: [MemoryRegion] = []
+    public var regions: [MemoryRegion] = []
 
     /// Linux 代码加载基址 (PIE 用, 实际地址由 mmap 决定)
     /// 注意: 必须保证此地址到 __isy_syscall_trap 的距离 < 128MB (BL 范围)
@@ -215,6 +215,19 @@ public final class LinuxAddressSpace {
             start: region.base.assumingMemoryBound(to: UInt32.self),
             count: count
         )
+    }
+
+    /// 移除所有区域 (用于 execve 后清理旧地址空间)
+    public func removeAllRegions() {
+        for r in regions {
+            munmap(r.base, r.size)
+        }
+        regions.removeAll()
+    }
+
+    /// 获取栈区域
+    public var stackRegion: MemoryRegion? {
+        regions.first { if case .stack = $0.backing { return true }; return false }
     }
 
     /// 释放所有区域

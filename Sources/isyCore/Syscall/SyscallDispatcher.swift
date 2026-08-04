@@ -27,7 +27,7 @@ public typealias SyscallHandler = (
 ) -> Int64
 
 /// syscall 分发器
-public final class SyscallDispatcher {
+public final class SyscallDispatcher: @unchecked Sendable {
     private var handlers: [Int32: SyscallHandler] = [:]
     public weak var process: LinuxProcess?
 
@@ -88,9 +88,78 @@ public func isySwiftSyscallBridge(
     guard let d = isyGlobalDispatcher else {
         return Errno.enosys.asSyscallReturn
     }
-    return d.dispatch(
+
+    // 在 syscall 处理前检查待处理信号
+    if let proc = d.process, proc.pendingSignal != 0, cpu != nil {
+        deliverSignalToCPU(proc: proc, cpu: cpu)
+    }
+
+    let result = d.dispatch(
         nr: Int32(truncatingIfNeeded: nr),
         cpu: cpu,
         args: (a0, a1, a2, a3, a4, a5)
     )
+
+    // 在 syscall 处理后再次检查待处理信号
+    if let proc = d.process, proc.pendingSignal != 0, cpu != nil {
+        deliverSignalToCPU(proc: proc, cpu: cpu)
+    }
+
+    return result
+}
+
+/// 将待处理信号投递到 CPU 状态 (修改 CPU 上下文以跳转到信号处理函数)
+private func deliverSignalToCPU(proc: LinuxProcess, cpu: UnsafeMutablePointer<isy_cpu_state_t>) {
+    let sig = proc.pendingSignal
+    proc.pendingSignal = 0
+
+    guard let handler = proc.signalHandlers[sig], handler != 0 else {
+        // SIG_DFL: 默认处理
+        if sig == Signal.sigint.rawValue || sig == Signal.sigterm.rawValue || sig == Signal.sigkill.rawValue {
+            // 终止进程
+            proc.exited = true
+            proc.exitCode = 128 + sig
+            isy_request_exit(proc.exitCode)
+        }
+        return
+    }
+    if handler == 1 {
+        // SIG_IGN: 忽略
+        return
+    }
+
+    // 构造信号栈帧: 在栈上保存完整寄存器上下文
+    let frameSize: UInt64 = 4096
+    var newSp = cpu.pointee.sp - frameSize
+    newSp &= ~UInt64(15)
+
+    // 保存当前 CPU 状态到栈帧 (供 sigreturn 恢复)
+    if let stackPtr = proc.addressSpace.hostPointer(for: VA(newSp), size: Int(frameSize)) {
+        // 使用 withUnsafeMutablePointer 将 tuple regs 作为数组访问
+        withUnsafeMutablePointer(to: &cpu.pointee.regs) { regsPtr in
+            regsPtr.withMemoryRebound(to: UInt64.self, capacity: 31) { regs in
+                var offset = 0
+                for i in 0..<31 {
+                    stackPtr.advanced(by: offset).assumingMemoryBound(to: UInt64.self).pointee = regs[i]
+                    offset += 8
+                }
+            }
+        }
+        stackPtr.advanced(by: 31 * 8).assumingMemoryBound(to: UInt64.self).pointee = cpu.pointee.sp
+        stackPtr.advanced(by: 32 * 8).assumingMemoryBound(to: UInt64.self).pointee = cpu.pointee.pc
+        stackPtr.advanced(by: 33 * 8).assumingMemoryBound(to: UInt64.self).pointee = cpu.pointee.pstate
+    }
+
+    // 设置新的 CPU 状态: 跳转到信号处理函数
+    withUnsafeMutablePointer(to: &cpu.pointee.regs) { regsPtr in
+        regsPtr.withMemoryRebound(to: UInt64.self, capacity: 31) { regs in
+            regs[0] = UInt64(bitPattern: Int64(sig))
+            regs[1] = 0
+            // lr = 信号处理返回地址 (指向 rt_sigreturn 或 trampoline)
+            let restoreHandler = proc.signalHandlers[31] ?? 0
+            regs[30] = restoreHandler != 0 ? restoreHandler : cpu.pointee.pc
+        }
+    }
+    cpu.pointee.sp = newSp
+    cpu.pointee.pc = handler
 }

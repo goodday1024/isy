@@ -66,6 +66,12 @@ void isy_set_syscall_handler(isy_syscall_handler_t handler);
 // 返回: exit code (cpu->regs[0])
 int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base);
 
+// 请求 Linux 进程退出 (由 exit/exit_group syscall handler 调用)
+//   code: 退出码 (写入 cpu->regs[0])
+// 此函数不会返回; 它恢复 iOS 上下文并跳转回 isy_enter_linux 的返回点.
+__attribute__((noreturn))
+void isy_request_exit(int code);
+
 // ---------- 指令 trap 解释器 ----------
 // 对不能直通的 ARM64 指令进行解释 (MRS/MSR/BRK/DC/IC/AT 等)
 // 当 patcher 把这些指令替换为 BRK #imm 后, trap loop 会捕获并模拟

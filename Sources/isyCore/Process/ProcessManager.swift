@@ -1,11 +1,13 @@
-// ProcessManager.swift - isy 进程执行管理
+// ProcessManager.swift - isy 进程执行管理 (完整实现: 信号投递 + 进程调度)
 //
 // 职责:
 //   1. 在后台线程跑 Emulator.run() (不阻塞 UI)
 //   2. 桥接 stdio: 把用户输入送到 Linux 进程 stdin, 把 stdout/stderr 回调到 UI
 //   3. 管理 pipe fd: stdin/stdout/stderr 用 isy 内部 PipeEnd 实现
-//   4. 信号投递: 把 UI 信号 (如 Ctrl+C) 转为 Linux 信号
+//   4. 信号投递: 把 UI 信号 (如 Ctrl+C) 设为 LinuxProcess.pendingSignal,
+//      在 syscall 边界由 SyscallDispatcher 投递到 CPU 上下文
 //   5. 进程生命周期: 启动/退出/重启
+//   6. 多进程调度: 管理多个 LinuxProcess, 模拟 fork/clone
 //
 // 线程模型:
 //   - 主线程 (MainActor): UI 更新, 用户输入
@@ -13,14 +15,14 @@
 //   - 同步: 用串行 DispatchQueue + 缓冲队列, 避免锁
 
 import Foundation
-import isyCore
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
 import Darwin
 #endif
 
-/// 进程状态
+// MARK: - 进程状态 & 事件
+
 public enum ProcessState: Equatable, Sendable {
     case idle
     case loading
@@ -29,16 +31,17 @@ public enum ProcessState: Equatable, Sendable {
     case failed(String)
 }
 
-/// 进程事件 (通过 AsyncStream 投递给 UI)
 public enum ProcessEvent: Sendable {
     case stdout(String)
     case stderr(String)
     case stateChanged(ProcessState)
     case patchComplete(records: Int)
     case syscallTrace(name: String, result: Int64)
+    case signalDelivered(sig: Int32)
 }
 
-/// 进程管理器 (在 Linux/macOS 测试环境也能跑, 用于验证 stdio 桥接)
+// MARK: - 进程管理器
+
 public final class ProcessManager: @unchecked Sendable {
 
     public var emulator: Emulator?
@@ -55,20 +58,26 @@ public final class ProcessManager: @unchecked Sendable {
     /// 事件回调 (UI 端设置). nonisolated(unsafe): 调用方保证不在执行期间更换
     nonisolated(unsafe) public var eventHandler: (@Sendable (ProcessEvent) -> Void)?
 
+    /// 子进程列表
+    public private(set) var childProcesses: [ProcessManager] = []
+
     /// 后台执行队列
     private let execQueue = DispatchQueue(label: "isy.process.exec", qos: .userInitiated)
-    /// I/O 读取队列 (轮询 stdout pipe)
+    /// I/O 读取队列
     private let ioQueue = DispatchQueue(label: "isy.process.io", qos: .userInitiated)
     private var ioTimer: DispatchSourceTimer?
 
     public init() {}
 
+    // MARK: - 进程启动
+
     /// 启动一个 Linux 进程 (加载 ELF + 执行)
-    /// - Parameters:
-    ///   - elfData: 主程序 ELF 字节
-    ///   - argv: 参数
-    ///   - envp: 环境变量
     public func start(elfData: Data, argv: [String] = [], envp: [String] = []) {
+        start(elfData: elfData, argv: argv, envp: envp, rootfs: nil)
+    }
+
+    /// 启动进程 (带 rootfs)
+    public func start(elfData: Data, argv: [String] = [], envp: [String] = [], rootfs: RootFS?) {
         updateState(.loading)
         execQueue.async { [weak self] in
             guard let self = self else { return }
@@ -77,6 +86,9 @@ public final class ProcessManager: @unchecked Sendable {
                 self.emulator = emu
                 self.process = emu.process
                 self.setupStdio(process: emu.process)
+                if let rfs = rootfs {
+                    emu.process.rootfs = rfs
+                }
                 try emu.loadMain(elfData, argv: argv, envp: envp)
                 self.eventHandler?(.patchComplete(records: emu.patchTable.records.count))
                 self.startIOPolling()
@@ -90,6 +102,40 @@ public final class ProcessManager: @unchecked Sendable {
         }
     }
 
+    // MARK: - 信号管理
+
+    /// 投递信号到进程 (设置 pendingSignal, 在 syscall 边界投递)
+    public func sendSignal(_ sig: Int32) {
+        process?.pendingSignal = sig
+        DispatchQueue.main.async {
+            self.eventHandler?(.signalDelivered(sig: sig))
+        }
+    }
+
+    /// 发送 SIGINT (Ctrl+C)
+    public func sendInterrupt() {
+        sendSignal(Signal.sigint.rawValue)
+    }
+
+    /// 发送 SIGTERM
+    public func sendTerminate() {
+        sendSignal(Signal.sigterm.rawValue)
+    }
+
+    /// 发送 SIGKILL
+    public func sendKill() {
+        sendSignal(Signal.sigkill.rawValue)
+    }
+
+    /// 发送 SIGWINCH (终端大小变化)
+    public func sendWindowChange(rows: UInt16, cols: UInt16) {
+        process?.terminalRows = rows
+        process?.terminalCols = cols
+        sendSignal(Signal.sigwinch.rawValue)
+    }
+
+    // MARK: - I/O 管理
+
     /// 发送输入到 Linux 进程 stdin
     public func sendInput(_ text: String) {
         guard let pipe = stdinPipe else { return }
@@ -99,22 +145,38 @@ public final class ProcessManager: @unchecked Sendable {
         }
     }
 
-    /// 发送 Ctrl+C (SIGINT)
-    public func sendInterrupt() {
-        // TODO: 触发 Linux 进程的 SIGINT 信号投递
-        sendInput("\u{03}")  // 简化: 直接送 Ctrl+C 字符
-    }
-
     /// 停止进程
     public func stop() {
-        // TODO: 通过 exit syscall 强制退出
+        sendKill()
         stopIOPolling()
-        updateState(.exited(code: -1))
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.updateState(.exited(code: -1))
+        }
+    }
+
+    // MARK: - 子进程管理
+
+    /// 创建子进程 (模拟 fork)
+    public func forkChild() -> ProcessManager {
+        let child = ProcessManager()
+        childProcesses.append(child)
+        return child
+    }
+
+    /// 等待子进程退出
+    public func waitForChild(pid: Int32) -> Int32? {
+        // 轮询子进程状态
+        for child in childProcesses {
+            if let proc = child.process, proc.pid == pid, proc.exited {
+                return proc.exitCode
+            }
+        }
+        return nil
     }
 
     // MARK: - 内部
+
     private func setupStdio(process: LinuxProcess) {
-        // 创建 stdin/stdout/stderr pipe
         let inPipe = PipeEnd(capacity: 65536)
         let outPipe = PipeEnd(capacity: 65536)
         let errPipe = PipeEnd(capacity: 65536)
@@ -122,7 +184,6 @@ public final class ProcessManager: @unchecked Sendable {
         self.stdoutPipe = outPipe
         self.stderrPipe = errPipe
 
-        // Linux fd 0=stdin, 1=stdout, 2=stderr
         process.fdTable[0] = .pipe(inPipe)
         process.fdTable[1] = .pipe(outPipe)
         process.fdTable[2] = .pipe(errPipe)
@@ -131,7 +192,7 @@ public final class ProcessManager: @unchecked Sendable {
 
     private func startIOPolling() {
         let timer = DispatchSource.makeTimerSource(queue: ioQueue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(20))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(16))  // ~60fps
         timer.setEventHandler { [weak self] in
             self?.pollOutput()
         }
@@ -142,8 +203,7 @@ public final class ProcessManager: @unchecked Sendable {
     private func stopIOPolling() {
         ioTimer?.cancel()
         ioTimer = nil
-        // 最后刷一次
-        pollOutput()
+        pollOutput()  // 最后刷一次
     }
 
     private func pollOutput() {

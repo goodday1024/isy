@@ -1,19 +1,14 @@
 // TerminalModel.swift - isy 终端模型
 //
 // 职责:
-//   1. 维护终端文本缓冲 (行 + 光标位置)
-//   2. 处理用户输入 (回车提交, 方向键历史)
-//   3. 桥接 isyCore Emulator: 把输入送到 Linux 进程 stdin, 把 stdout 追加到缓冲
-//   4. 解析 ANSI 转义序列 (颜色/光标移动) -> AttributedString
+//   1. 维护终端文本缓冲 (通过 TerminalBuffer + ANSI 解析)
+//   2. 处理用户输入 (回车提交, 方向键历史, Ctrl+C/D)
+//   3. 桥接 isyCore ProcessManager: 把输入送到 Linux 进程 stdin, 把 stdout 追加到缓冲
+//   4. demo 模式使用 BuiltinShell 提供完整 shell 体验
 //
 // 集成模式:
-//   - 真实模式: connect(to: Emulator) 后, 输入直接送 Linux 进程, 输出来自 syscall write(1)
-//   - demo 模式: 内置 echo/help/ls/uname 等命令, 用于 UI 独立预览 (无 rootfs 时)
-//
-// 注意: isyCore 的 Emulator.run() 是同步阻塞的. 真实模式下需要:
-//   - 后台线程跑 Emulator.run()
-//   - 主线程通过 DispatchQueue.main 更新 UI
-//   - 用管道/缓冲区在两线程间传 I/O
+//   - 真实模式: connect(to: processManager) 后, 输入直接送 Linux 进程, 输出来自 syscall write(1)
+//   - demo 模式: 使用 BuiltinShell 提供 30+ 命令, 管道, 重定向等功能
 
 #if canImport(SwiftUI)
 import Foundation
@@ -24,8 +19,8 @@ import isyCore
 @MainActor
 public final class TerminalModel: ObservableObject {
 
-    /// 终端行 (已提交的输出 + 当前输入行)
-    @Published public var lines: [TerminalLine] = []
+    /// 终端缓冲 (ANSI 解析)
+    public let buffer: TerminalBuffer
     /// 当前输入缓冲 (未提交)
     @Published public var currentInput: String = ""
     /// 命令历史
@@ -36,35 +31,106 @@ public final class TerminalModel: ObservableObject {
     @Published public var isRunning: Bool = false
     /// 提示符
     @Published public var prompt: String = "isy$ "
+    /// 进程状态
+    @Published public var processState: String = "idle"
+    /// 终端行更新触发器
+    @Published public var linesVersion: Int = 0
 
-    /// isy 进程 (真实模式时非 nil)
-    public var process: LinuxProcess?
+    /// isy 进程管理器 (真实模式时非 nil)
+    public var processManager: ProcessManager?
     /// demo 模式标志
     public var demoMode: Bool = true
+    /// 内置 Shell (demo 模式)
+    public var builtinShell: BuiltinShell?
+    /// 最大输出行数
+    public var maxLines: Int = 10000
 
     private let queue = DispatchQueue(label: "isy.terminal.io", qos: .userInitiated)
 
-    public init(demoMode: Bool = true) {
+    public init(demoMode: Bool = true, rootfs: RootFS? = nil, cols: Int = 80, rows: Int = 24) {
+        self.buffer = TerminalBuffer(cols: cols, rows: rows)
         self.demoMode = demoMode
         if demoMode {
-            lines.append(TerminalLine(text: "isy 0.1.0-dev - iOS System", style: .title))
-            lines.append(TerminalLine(text: "近原生 ARM64 Linux 用户态运行时 (load-time binary patching)", style: .dim))
-            lines.append(TerminalLine(text: "输入 'help' 查看可用命令, 'isy' 查看 runtime 信息", style: .dim))
-            lines.append(TerminalLine(text: ""))
+            self.builtinShell = BuiltinShell(rootfs: rootfs)
+            appendBanner()
         }
     }
 
-    /// 连接真实 isy 进程 (退出 demo 模式)
-    public func connect(to process: LinuxProcess) {
-        self.process = process
+    public var lines: [TerminalLine] {
+        buffer.visibleLines()
+    }
+
+    public var attributedLines: [[AttributedCharacter]] {
+        buffer.attributedLines()
+    }
+
+    private func appendBanner() {
+        let banner = """
+        \u{1B}[1;36misy 0.1.0-dev\u{1B}[0m - \u{1B}[32miOS System\u{1B}[0m
+        \u{1B}[2m近原生 ARM64 Linux 用户态运行时 (load-time binary patching)\u{1B}[0m
+        \u{1B}[2m输入 'help' 查看可用命令, 'isy' 查看 runtime 信息\u{1B}[0m
+
+        """
+        writeToBuffer(banner)
+    }
+
+    /// 连接真实 isy 进程管理器 (退出 demo 模式)
+    public func connect(to pm: ProcessManager) {
+        self.processManager = pm
         self.demoMode = false
-        self.prompt = "isy:\(process.cwd)$ "
+        self.prompt = "$ "
+        self.builtinShell = nil
+
+        pm.eventHandler = { [weak self] event in
+            DispatchQueue.main.async {
+                self?.handleProcessEvent(event)
+            }
+        }
+    }
+
+    /// 断开连接
+    public func disconnect() {
+        processManager?.stop()
+        processManager = nil
+        demoMode = true
+        prompt = "isy$ "
+        builtinShell = BuiltinShell(rootfs: nil)
+    }
+
+    /// 处理进程事件
+    private func handleProcessEvent(_ event: ProcessEvent) {
+        switch event {
+        case .stdout(let text):
+            appendOutput(text)
+        case .stderr(let text):
+            writeToBuffer("\u{1B}[31m\(text)\u{1B}[0m")
+        case .stateChanged(let state):
+            switch state {
+            case .idle: processState = "idle"
+            case .loading: processState = "loading"
+            case .running: processState = "running"; isRunning = true
+            case .exited(let code):
+                processState = "exited(\(code))"
+                isRunning = false
+                writeToBuffer("\u{1B}[2m[进程已退出, 退出码: \(code)]\u{1B}[0m\n")
+            case .failed(let msg):
+                processState = "failed"
+                isRunning = false
+                writeToBuffer("\u{1B}[31m[启动失败: \(msg)]\u{1B}[0m\n")
+            }
+        case .patchComplete(let records):
+            writeToBuffer("\u{1B}[32m[Binary patching 完成: \(records) 条 SVC->BL 替换]\u{1B}[0m\n")
+        case .syscallTrace(let name, let result):
+            writeToBuffer("\u{1B}[2m[syscall] \(name) = \(result)\u{1B}[0m\n")
+        case .signalDelivered(let sig):
+            writeToBuffer("\u{1B}[2m[信号 \(sig) 已投递]\u{1B}[0m\n")
+        }
     }
 
     /// 提交当前输入 (用户按回车)
     public func submitInput() {
-        let input = currentInput
-        lines.append(TerminalLine(text: prompt + input, style: .prompt))
+        let input = currentInput.trimmingCharacters(in: .newlines)
+        writeToBuffer("\(prompt)\(input)\n")
         if !input.isEmpty {
             history.append(input)
         }
@@ -76,6 +142,82 @@ public final class TerminalModel: ObservableObject {
         } else {
             executeRealCommand(input)
         }
+    }
+
+    /// 发送 Ctrl+C (SIGINT)
+    public func sendInterrupt() {
+        if demoMode {
+            writeToBuffer("^C\n")
+        } else {
+            processManager?.sendInterrupt()
+            writeToBuffer("^C")
+        }
+    }
+
+    /// 发送 Ctrl+D (EOF)
+    public func sendEOF() {
+        if demoMode {
+            writeToBuffer("\u{1B}[2m(demo 模式: Ctrl+D 无效果)\u{1B}[0m\n")
+        } else {
+            processManager?.sendInput("\u{04}")
+        }
+    }
+
+    /// 发送特殊字符 (Tab, 上下箭头等)
+    public func sendSpecialChar(_ char: String) {
+        if demoMode {
+            // 在 demo 模式下, Tab 用于补全
+            if char == "\t" {
+                // 简单文件名补全
+                currentInput = autoComplete(currentInput)
+                return
+            }
+            currentInput += char
+        } else {
+            processManager?.sendInput(char)
+        }
+    }
+
+    /// 插入特殊字符到输入
+    public func insertText(_ text: String) {
+        currentInput += text
+    }
+
+    /// 简单的文件名补全
+    private func autoComplete(_ input: String) -> String {
+        guard let shell = builtinShell else { return input }
+        let parts = input.split(separator: " ")
+        let lastPart = parts.last.map(String.init) ?? input
+        let dir: String
+        let prefix: String
+        if lastPart.contains("/") {
+            let p = (lastPart as NSString)
+            dir = shell.env.hostPath(shell.env.resolve(p.deletingLastPathComponent))
+            prefix = p.lastPathComponent
+        } else {
+            dir = shell.env.hostPath(shell.env.cwd)
+            prefix = lastPart
+        }
+
+        guard let items = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return input }
+        let matches = items.filter { $0.hasPrefix(prefix) }
+        if matches.count == 1 {
+            let completion = matches[0]
+            if parts.count > 1 {
+                let rest = parts.dropLast().joined(separator: " ")
+                if lastPart.contains("/") {
+                    let dirPart = (lastPart as NSString).deletingLastPathComponent
+                    return rest + " " + dirPart + "/" + completion
+                }
+                return rest + " " + completion
+            }
+            return completion
+        } else if matches.count > 1 {
+            // 显示所有匹配
+            writeToBuffer("\n\(matches.joined(separator: "  "))\n\(prompt)\(input)")
+            return input
+        }
+        return input
     }
 
     /// 从历史中选取
@@ -100,102 +242,53 @@ public final class TerminalModel: ObservableObject {
         }
     }
 
-    /// 追加输出 (供 Emulator 回调)
-    public func appendOutput(_ text: String, style: TerminalLineStyle = .normal) {
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            lines.append(TerminalLine(text: String(line), style: style))
-        }
+    /// 追加输出
+    public func appendOutput(_ text: String) {
+        writeToBuffer(text)
     }
 
-    // MARK: - demo 模式命令执行
+    /// 写入终端缓冲 (ANSI 解析)
+    private func writeToBuffer(_ text: String) {
+        buffer.write(text)
+        linesVersion += 1
+    }
+
+    /// 清屏
+    public func clearScreen() {
+        buffer.reset()
+        linesVersion += 1
+    }
+
+    /// 终端大小变更
+    public func resizeTerminal(cols: Int, rows: Int) {
+        buffer.resize(cols: cols, rows: rows)
+        processManager?.sendWindowChange(rows: UInt16(rows), cols: UInt16(cols))
+        linesVersion += 1
+    }
+
+    // MARK: - demo 模式命令执行 (使用 BuiltinShell)
+
     private func executeDemoCommand(_ raw: String) {
-        let parts = raw.split(separator: " ").map(String.init)
-        guard let cmd = parts.first?.lowercased(), !cmd.isEmpty else { return }
         isRunning = true
-
         queue.async { [weak self] in
-            let output: [String]
-            switch cmd {
-            case "help":
-                output = [
-                    "isy 内置命令 (demo 模式):",
-                    "  help     显示此帮助",
-                    "  isy      显示 isy 运行时信息",
-                    "  ls       列出虚拟目录",
-                    "  uname    显示系统信息",
-                    "  echo     回显参数",
-                    "  bench    跑 BinaryPatcher 微基准",
-                    "  clear    清屏",
-                    "  exit     退出 (iOS App 上不可用)",
-                    "",
-                    "真实模式 (连接 isyCore Emulator) 下, 此处显示 Linux 进程输出.",
-                ]
-            case "isy":
-                output = [
-                    "isy 0.1.0-dev - iOS System",
-                    "  架构: ARM64 Linux -> iOS ARM64 近原生",
-                    "  核心创新: load-time binary patching (SVC #0 -> BL __isy_syscall_trap)",
-                    "  执行模型: 99.99% 指令原生执行, 仅 syscall 边界陷入翻译层",
-                    "  合规性: 不写可执行页 (W^X), 非 JIT, 符合 App Store 规则",
-                    "  性能: patch 吞吐 ~300 MB/s, syscall 开销 < 真实内核切换",
-                ]
-            case "ls":
-                output = ["bin   etc   lib   root  tmp   usr   var", "dev   home  proc  sbin  sys   opt"]
-            case "uname":
-                output = ["Linux isy 5.15.0-isy #1 aarch64 aarch64 aarch64 GNU/Linux"]
-            case "echo":
-                output = [parts.dropFirst().joined(separator: " ")]
-            case "bench":
-                let throughput = self?.runPatcherBenchDemo() ?? 0
-                output = [
-                    "BinaryPatcher 微基准 (1M 指令, 1% SVC):",
-                    String(format: "  吞吐: %.1f MB/s", throughput),
-                    String(format: "  等效: 10MB ELF patch 耗时 %.1f ms", 10 * 1024 / Double(throughput)),
-                ]
-            case "clear":
-                DispatchQueue.main.async { self?.lines.removeAll() }
-                return
-            case "exit":
-                output = ["exit: 在真实模式下退出当前 shell"]
-            default:
-                output = ["\(cmd): command not found (demo 模式, 输入 help 查看可用命令)"]
+            guard let self = self else { return }
+            let output: String
+            if let shell = self.builtinShell {
+                output = shell.execute(raw)
+            } else {
+                output = "BuiltinShell not available"
             }
+            let finalOutput = output.isEmpty ? "" : output + (output.hasSuffix("\n") ? "" : "\n")
             DispatchQueue.main.async {
-                for line in output {
-                    self?.lines.append(TerminalLine(text: line, style: .output))
-                }
-                self?.isRunning = false
+                self.writeToBuffer(finalOutput)
+                self.isRunning = false
             }
         }
-    }
-
-    /// demo 模式 patcher 基准 (nonisolated: 纯计算, 不访问 @Published 状态)
-    nonisolated private func runPatcherBenchDemo() -> Double {
-        let count = 1_000_000
-        var insns = [UInt32](repeating: 0xD503201F, count: count)
-        for i in stride(from: 0, to: count, by: 100) { insns[i] = 0xD4000001 }
-        let config = PatchConfig(trapAddress: 0x10000)
-        let start = Date()
-        do {
-            try insns.withUnsafeMutableBufferPointer { ptr in
-                var table = PatchTable()
-                try BinaryPatcher.patchSegment(ptr, baseVA: 0x400000, config: config,
-                                               segmentIndex: 0, into: &table)
-            }
-        } catch { return 0 }
-        let elapsed = Date().timeIntervalSince(start)
-        return Double(count * 4) / 1024 / 1024 / elapsed
     }
 
     // MARK: - 真实模式 (连接 isyCore)
     private func executeRealCommand(_ raw: String) {
-        // 真实模式下: 把命令送到 Linux 进程的 stdin (通过 pipe fd)
-        // 当前骨架: 调用 isyCore Emulator 执行. 完整实现需要:
-        //   1. 把 raw + "\n" 写到 process 的 stdin fd
-        //   2. Linux shell (busybox/bash) 读取并执行
-        //   3. shell 的 stdout 通过 write(1) 回调 appendOutput
-        // 这里预留接口, 实际 I/O 桥接在 ProcessManager.swift 完成
-        appendOutput("(真实模式待启用: 需要加载 Linux rootfs + shell ELF)", style: .dim)
+        processManager?.sendInput(raw + "\n")
     }
 }
 

@@ -25,6 +25,9 @@ public final class Emulator {
     /// 已加载的 ELF 镜像 (主程序)
     public private(set) var mainImage: ELFImage?
 
+    /// 动态链接器 (如果主程序是动态链接的)
+    public private(set) var dynamicLinker: DynamicLinker?
+
     public init(config: EmulatorConfig = .default) {
         self.config = config
         self.process = LinuxProcess(pid: 1)
@@ -36,33 +39,119 @@ public final class Emulator {
         _ = isy_runtime_anchor()
     }
 
-    /// 加载主程序 ELF
+    /// 加载主程序 ELF (支持静态和动态链接)
     /// - Parameters:
     ///   - data: ELF 文件原始字节
     ///   - argv: 命令行参数 (argv[0] 通常是程序名)
     ///   - envp: 环境变量
+    ///   - loadLibrary: 加载共享库的回调 (从 RootFS 读取 .so 文件)
     /// - Returns: 入口点 VA
     @discardableResult
-    public func loadMain(_ data: Data, argv: [String] = [], envp: [String] = []) throws -> UInt64 {
+    public func loadMain(_ data: Data, argv: [String] = [], envp: [String] = [],
+                         loadLibrary: ((String) throws -> Data)? = nil) throws -> UInt64 {
         // 1. 解析 ELF
         let baseVA = config.loadBase
         let image = try ELFParser.parse(data: data, baseAddress: baseVA)
 
         // 2. 加载 PT_LOAD 段
         var execSegments: [(region: MemoryRegion, segIndex: Int, phdr: ELF64ProgramHeader)] = []
+        var allSegments: [(region: MemoryRegion, segIndex: Int, phdr: ELF64ProgramHeader)] = []
         for (i, ph) in image.loadSegments.enumerated() {
             let region = try data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
                 try process.addressSpace.loadELFSegment(
                     data: buf.baseAddress!, phdr: ph, baseVA: baseVA, segIndex: i
                 )
             }
+            allSegments.append((region, i, ph))
             if ph.isExecutable {
                 execSegments.append((region, i, ph))
             }
         }
         process.addressSpace.codeBase = baseVA
 
-        // 3. 对每个可执行段做 binary patching
+        // 3. 动态链接: 加载解释器和依赖库
+        var interpreterEntry: UInt64?
+        if let interpPath = image.interp, let loadLib = loadLibrary {
+            let dynamicLinker = DynamicLinker(
+                rootfs: process.rootfs,
+                addressSpace: process.addressSpace
+            )
+            process.dynamicLinker = dynamicLinker
+            self.dynamicLinker = dynamicLinker
+
+            // 确定主要段的主机基址
+            guard let mainHostBase = allSegments.first?.region.base else {
+                throw ELFError.invalidProgramHeader
+            }
+
+            // 加载解释器 (ld-linux-aarch64.so.1)
+            let interpData = try loadLib(interpPath)
+            let interpBase = config.interpBase
+            let interpImage = try ELFParser.parse(data: interpData, baseAddress: interpBase)
+            let interpEntry = interpImage.entryPoint
+
+            // 加载解释器的 PT_LOAD 段
+            var interpExecSegments: [(region: MemoryRegion, segIndex: Int, phdr: ELF64ProgramHeader)] = []
+            for (i, ph) in interpImage.loadSegments.enumerated() {
+                let region = try interpData.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+                    try process.addressSpace.loadELFSegment(
+                        data: buf.baseAddress!, phdr: ph, baseVA: interpBase, segIndex: 100 + i
+                    )
+                }
+                if ph.isExecutable {
+                    interpExecSegments.append((region, i, ph))
+                }
+            }
+
+            // 加载依赖库
+            _ = try dynamicLinker.loadDependencies(
+                of: image, mainBase: baseVA, mainHostBase: mainHostBase, mainData: data,
+                loadData: loadLib
+            )
+
+            // 对解释器可执行段做 binary patching
+            let trapAddr = UInt64(isy_get_trap_address())
+            let patchConfig = PatchConfig(trapAddress: trapAddr)
+            for seg in interpExecSegments {
+                let patchStartVA = seg.phdr.vaddr + interpBase
+                let patchByteSize = Int(seg.phdr.filesz)
+                let patchCount = patchByteSize / 4
+                guard let stream = process.addressSpace.instructionStream(
+                    for: seg.region, baseVA: patchStartVA
+                ) else { continue }
+                let subStream = UnsafeMutableBufferPointer<UInt32>(
+                    start: stream.baseAddress, count: min(patchCount, stream.count)
+                )
+                try BinaryPatcher.patchSegment(
+                    subStream, baseVA: patchStartVA, config: patchConfig,
+                    segmentIndex: seg.segIndex, into: &patchTable
+                )
+            }
+
+            // 对解释器段做 W^X 切换
+            for seg in interpExecSegments {
+                try process.addressSpace.makeExecutable(seg.region)
+            }
+
+            // 对每个加载的库做重定位
+            for lib in dynamicLinker.libraries {
+                _ = try dynamicLinker.relocate(
+                    image: lib.image, base: lib.baseAddress,
+                    hostPtr: lib.hostBase, data: interpData
+                )
+            }
+
+            // 执行 .init_array
+            dynamicLinker.runInitArrays(
+                image: interpImage, base: interpBase,
+                hostPtr: interpExecSegments.first?.region.base ?? mainHostBase,
+                data: interpData
+            )
+
+            interpreterEntry = interpEntry
+        }
+
+        // 4. 对每个可执行段做 binary patching
         let trapAddr = UInt64(isy_get_trap_address())
         let patchConfig = PatchConfig(trapAddress: trapAddr)
 
@@ -86,12 +175,12 @@ public final class Emulator {
             )
         }
 
-        // 4. flush I-cache + 切换可执行段为 R-X (W^X)
+        // 5. flush I-cache + 切换可执行段为 R-X (W^X)
         for seg in execSegments {
             try process.addressSpace.makeExecutable(seg.region)
         }
 
-        // 5. 构造启动栈
+        // 6. 构造启动栈
         let stackRegion = try process.addressSpace.allocateAnonymous(
             size: config.stackSize, prot: [.read, .write],
             vaHint: config.stackBase, backing: .stack
@@ -100,6 +189,13 @@ public final class Emulator {
 
         process.mainImage = image
         self.mainImage = image
+
+        // 如果是动态链接的, 入口点是解释器而非主程序
+        if let interpEntry = interpreterEntry {
+            // 将主程序入口信息通过 auxv 传递给解释器
+            process.cpu.pc = interpEntry
+            return interpEntry
+        }
         return image.entryPoint
     }
 
@@ -209,6 +305,8 @@ public final class Emulator {
 public struct EmulatorConfig: Sendable {
     /// Linux 代码加载基址 (PIE)
     public var loadBase: UInt64 = 0x10000000   // 256MB
+    /// 解释器 (ld-linux) 加载基址
+    public var interpBase: UInt64 = 0x20000000  // 512MB
     /// 主线程栈基址
     public var stackBase: UInt64 = 0x70000000_00000000  // 7TB (iOS 高地址区)
     /// 栈大小

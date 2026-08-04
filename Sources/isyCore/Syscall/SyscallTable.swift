@@ -105,6 +105,14 @@ public enum LinuxSyscall: Int32 {
     case sendmsg = 211
     case recvmsg = 212
 
+    // 文件描述符
+    case dup = 23
+    case dup2 = 33
+    case dup3 = 24
+
+    // 进程控制
+    case prctl = 167
+
     // 时间
     case clock_gettime = 113
     case clock_nanosleep = 115

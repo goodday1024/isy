@@ -66,12 +66,16 @@ public extension SyscallDispatcher {
         register(.exit) { _, code, _, _, _, _, _ in
             process.exitCode = Int32(truncatingIfNeeded: Int64(bitPattern: code))
             process.exited = true
-            // 抛出特殊错误让 Emulator 退出执行循环
+            // 调用 isy_request_exit 恢复 iOS 上下文并返回
+            // 注意: isy_request_exit 不返回 (noreturn)
+            isy_request_exit(process.exitCode)
+            // 永远不会到达这里, 但编译器需要 return
             return 0
         }
         register(.exitGroup) { _, code, _, _, _, _, _ in
             process.exitCode = Int32(truncatingIfNeeded: Int64(bitPattern: code))
             process.exited = true
+            isy_request_exit(process.exitCode)
             return 0
         }
         register(.getpid) { _, _, _, _, _, _, _ in Int64(process.pid) }
@@ -251,12 +255,38 @@ public extension LinuxProcess {
             return Errno.efault.asSyscallReturn
         }
         let path = String(cString: pathPtr.assumingMemoryBound(to: CChar.self))
-        let resolved = resolvePath(path, dirfd: dirfd)
 
         // 转换 Linux open flags -> 宿主 flags (大部分一致)
         var hostFlags = flags
         // O_LARGEFILE 在 32-bit 是 0o100000, 64-bit 不需要
         hostFlags &= ~0o100000
+
+        // 判断是否为写操作: O_WRONLY=1, O_RDWR=2, O_CREAT=0o100, O_TRUNC=0o1000, O_APPEND=0o2000
+        let isWrite = (flags & 0o3) != 0  // O_WRONLY 或 O_RDWR
+        let isCreate = (flags & 0o100) != 0  // O_CREAT
+
+        // 对于写操作或创建, 使用 resolvePathForWrite (OverlayFS CoW)
+        let resolved: String
+        if isWrite || isCreate {
+            resolved = resolvePathForWrite(path, dirfd: dirfd, operation: isCreate ? .create : .write)
+        } else {
+            // 检查是否请求打开目录
+            if (flags & 0o200000) != 0 {  // O_DIRECTORY
+                let linuxPath = path.hasPrefix("/") ? path : cwd + "/" + path
+                let rp = resolvePath(path, dirfd: dirfd)
+                var st = stat()
+                if stat(rp, &st) < 0 {
+                    return Errno.fromHost(Int32(errno)).asSyscallReturn
+                }
+                if (st.st_mode & 0o170000) != 0o040000 {
+                    return Errno.enotdir.asSyscallReturn
+                }
+                // 返回目录 fd (使用 RootFS 合并视图)
+                return Int64(openDirectory(linuxPath: linuxPath))
+            }
+            resolved = resolvePath(path, dirfd: dirfd)
+        }
+
         // O_CLOEXEC 一致
         let hostFd = open(resolved, hostFlags, mode_t(mode & 0o7777))
         if hostFd < 0 {
@@ -521,8 +551,18 @@ public extension LinuxProcess {
 
     // ---------- 路径解析 ----------
     func resolvePath(_ path: String, dirfd: Int32) -> String {
-        // 第一版: 直接返回 path (假设已在沙盒根下)
-        // 后续 VirtualFS 会做 / -> $HOME/isy_root/ 的映射
+        // 如果有 RootFS, 使用 RootFS 路径解析
+        if let rfs = rootfs {
+            if path.hasPrefix("/") {
+                return rfs.resolve(path)
+            }
+            if path == "." || path.isEmpty {
+                return rfs.resolve(cwd)
+            }
+            let combined = cwd + "/" + path
+            return rfs.resolve(combined)
+        }
+        // 兜底: 简单路径拼接
         if path.hasPrefix("/") {
             return path
         }
@@ -530,6 +570,20 @@ public extension LinuxProcess {
             return cwd
         }
         return cwd + "/" + path
+    }
+
+    /// 解析写入路径 (使用 RootFS OverlayFS)
+    func resolvePathForWrite(_ path: String, dirfd: Int32, operation: FileOp = .write) -> String {
+        if let rfs = rootfs {
+            let linuxPath: String
+            if path.hasPrefix("/") {
+                linuxPath = path
+            } else {
+                linuxPath = cwd + "/" + path
+            }
+            return (try? rfs.resolveForWrite(linuxPath, operation: operation)) ?? linuxPath
+        }
+        return resolvePath(path, dirfd: dirfd)
     }
 }
 

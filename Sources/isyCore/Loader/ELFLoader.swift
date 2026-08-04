@@ -100,7 +100,7 @@ public struct ELFParser {
 
         let phdrs = try parseProgramHeaders(data, header: header)
         var interp: String? = nil
-        let needed: [String] = []
+        var needed: [String] = []
 
         for ph in phdrs {
             if ph.type == ELFType.interp.rawValue {
@@ -113,10 +113,12 @@ public struct ELFParser {
                     interp = String(bytes: bytes, encoding: .utf8)
                 }
             }
+            if ph.type == ELFType.dynamic.rawValue {
+                // PT_DYNAMIC: 解析 NEEDED 依赖
+                needed = parseNeeded(data: data, phdr: ph)
+            }
         }
 
-        // 解析 .dynamic 段的 NEEDED (简化: 仅当有 PT_DYNAMIC)
-        // 完整实现需要解析 .dynstr, 这里先返回空, 后续 DynamicLinker.swift 补全
         let loadSegs = phdrs.filter { $0.isLoad }
 
         return ELFImage(
@@ -188,5 +190,53 @@ public struct ELFParser {
             ))
         }
         return result
+    }
+
+    /// 解析 PT_DYNAMIC 段中的 NEEDED 依赖
+    static func parseNeeded(data: Data, phdr: ELF64ProgramHeader) -> [String] {
+        var needed: [String] = []
+        let entrySize = 16  // Elf64_Dyn = 16 bytes
+        let count = Int(phdr.filesz) / entrySize
+        let start = Int(phdr.offset)
+
+        var strtabOffset: UInt64 = 0
+        var neededTags: [UInt64] = []
+
+        // 第一遍: 收集 DT_STRTAB 和 DT_NEEDED
+        for i in 0..<count {
+            let off = start + i * entrySize
+            guard off + 16 <= data.count else { break }
+
+            func u64(_ o: Int) -> UInt64 {
+                let lo: UInt64 = UInt64(data[off+o]) | (UInt64(data[off+o+1]) << 8) |
+                                 (UInt64(data[off+o+2]) << 16) | (UInt64(data[off+o+3]) << 24)
+                let hi: UInt64 = UInt64(data[off+o+4]) | (UInt64(data[off+o+5]) << 8) |
+                                 (UInt64(data[off+o+6]) << 16) | (UInt64(data[off+o+7]) << 24)
+                return lo | (hi << 32)
+            }
+
+            let tag = u64(0)
+            let val = u64(8)
+
+            if tag == 5 {  // DT_STRTAB
+                strtabOffset = val
+            } else if tag == 1 {  // DT_NEEDED
+                neededTags.append(val)
+            } else if tag == 0 {  // DT_NULL
+                break
+            }
+        }
+
+        // 第二遍: 从 .dynstr 读取名字
+        for nameOff in neededTags {
+            let off = Int(strtabOffset) + Int(nameOff)
+            guard off < data.count else { continue }
+            var end = off
+            while end < data.count && data[end] != 0 { end += 1 }
+            if let name = String(bytes: data[off..<end], encoding: .utf8) {
+                needed.append(name)
+            }
+        }
+        return needed
     }
 }
