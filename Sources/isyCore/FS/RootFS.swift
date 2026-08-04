@@ -171,10 +171,14 @@ public final class RootFS {
     }
 
     private func extractArchive(_ archive: String, to dest: String) throws {
-        #if canImport(Glibc)
-        // Linux: 用系统 tar
+        #if canImport(Glibc) || (canImport(Darwin) && !os(iOS))
+        // Linux / macOS: 用系统 tar (Process 在 iOS 上不可用)
         let task = Process()
+        #if canImport(Glibc)
         task.launchPath = "/bin/tar"
+        #else
+        task.launchPath = "/usr/bin/tar"
+        #endif
         task.arguments = ["-xzf", archive, "-C", dest]
         try task.run()
         task.waitUntilExit()
@@ -182,15 +186,10 @@ public final class RootFS {
             throw RootFSError.extractFailed("tar exited \(task.terminationStatus)")
         }
         #else
-        // Darwin: 用 FileManager 解压 (或调系统 tar)
-        let task = Process()
-        task.launchPath = "/usr/bin/tar"
-        task.arguments = ["-xzf", archive, "-C", dest]
-        try task.run()
-        task.waitUntilExit()
-        if task.terminationStatus != 0 {
-            throw RootFSError.extractFailed("tar exited \(task.terminationStatus)")
-        }
+        // iOS: 无 Process, 改用 Foundation 内置解压 (tar.gz -> tar + gzip)
+        // 简化实现: 抛出错误, 实际 iOS 端会在 App 启动时调用 SSZipArchive
+        // 或在构建期预解压 rootfs 到 App bundle (推荐做法)
+        throw RootFSError.extractFailed("iOS 平台需在构建期预解压 rootfs 或集成第三方解压库")
         #endif
     }
 

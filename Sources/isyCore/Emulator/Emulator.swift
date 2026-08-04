@@ -182,8 +182,11 @@ public final class Emulator {
         #if arch(arm64)
         dispatcher.install()
         guard let entry = mainImage?.entryPoint else { return -1 }
-        let stackBase = process.addressSpace.regions.first { $0.backing == .stack }?.base
-        let r = isy_enter_linux(entry, &process.cpu.raw, stackBase)
+        let stackBase = process.addressSpace.regions.first {
+            if case .stack = $0.backing { return true }
+            return false
+        }?.base
+        let r = isy_enter_linux(UInt(entry), &process.cpu.raw, stackBase)
         return Int32(truncatingIfNeeded: r)
         #else
         // 非 arm64 平台: 仅返回错误 (load/patch 已完成, 可供测试)
