@@ -37,9 +37,6 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources/isyApp
-      - path: Resources
-        type: folder
-        optional: true
     dependencies:
       - package: isy
         product: isyCore
