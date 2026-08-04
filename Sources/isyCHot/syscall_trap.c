@@ -193,7 +193,7 @@ void __isy_syscall_trap(void) {
 static uint64_t g_isy_saved_ios_sp = 0;
 static uint64_t g_isy_saved_ios_fp = 0;
 static uint64_t g_isy_saved_ios_lr = 0;
-static int      g_isy_exit_code = 0;
+static uint64_t g_isy_exit_code = 0;
 
 // ---------- 执行入口 ----------
 // 进入 Linux 代码执行. 使用 blr x16 调用入口, 以便 Linux exit 后能返回.
@@ -233,7 +233,7 @@ int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base) {
         : [tls] "r"(cpu->regs[18]),
           "r"(x0), "r"(x1), "r"(x2), "r"(x3),
           "r"(x4), "r"(x5), "r"(x16), "r"(sp)
-        : "memory", "x0"
+        : "memory"
     );
 
     return g_isy_exit_code;
@@ -243,9 +243,9 @@ int isy_enter_linux(uintptr_t entry, isy_cpu_state_t *cpu, void *stack_base) {
 // 由 exit/exit_group syscall handler 调用.
 // 恢复 iOS 上下文并返回到 isy_enter_linux 的调用者.
 // 此函数不返回 (noreturn).
-__attribute__((naked, used))
+__attribute__((noinline, used))
 void isy_request_exit(int code) {
-    (void)code;
+    g_isy_exit_code = (uint64_t)(int64_t)code;
     __asm__ volatile(
         // 恢复 iOS 栈指针和帧指针
         "mov sp, %[ios_sp]\n"
@@ -258,7 +258,7 @@ void isy_request_exit(int code) {
         : [ios_sp] "r"(g_isy_saved_ios_sp),
           [ios_fp] "r"(g_isy_saved_ios_fp),
           [ios_lr] "r"(g_isy_saved_ios_lr),
-          [exit_code] "r"((uint64_t)(int64_t)code)
+          [exit_code] "r"(g_isy_exit_code)
         : "memory"
     );
     __builtin_unreachable();
