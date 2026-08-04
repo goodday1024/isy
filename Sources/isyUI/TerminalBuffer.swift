@@ -89,7 +89,7 @@ public final class TerminalBuffer {
         self.cols = cols
         self.rows = rows
         self.scrollBottom = rows - 1
-        let newGrid = Array(repeating: Array(repeating: TerminalCell(), count: cols), count: rows)
+        var newGrid = Array(repeating: Array(repeating: TerminalCell(), count: cols), count: rows)
         for r in 0..<min(rows, grid.count) {
             for c in 0..<min(cols, grid[r].count) {
                 newGrid[r][c] = grid[r][c]

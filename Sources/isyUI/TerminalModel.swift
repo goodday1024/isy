@@ -270,10 +270,11 @@ public final class TerminalModel: ObservableObject {
 
     private func executeDemoCommand(_ raw: String) {
         isRunning = true
+        let shell = self.builtinShell
         queue.async { [weak self] in
             guard let self = self else { return }
             let output: String
-            if let shell = self.builtinShell {
+            if let shell = shell {
                 output = shell.execute(raw)
             } else {
                 output = "BuiltinShell not available"
