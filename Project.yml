@@ -27,6 +27,9 @@ settings:
     LLVM_LTO: NO
     SWIFT_OPTIMIZATION_LEVEL: "-O"
     GCC_OPTIMIZATION_LEVEL: "s"
+    # 强制加载 isyCHot 所有 .o (naked 函数通过汇编 bl 引用的符号
+    # 在 LTO/静态库链接时可能被丢弃)
+    OTHER_LDFLAGS: "-ObjC -all_load"
     # 允许 isyCore 的 C target (isyCHot) 链接
     SWIFT_PACKAGE_MANAGER_BUILDS: YES
 

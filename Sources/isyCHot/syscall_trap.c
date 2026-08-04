@@ -37,7 +37,8 @@ void isy_reset_stats(void) { g_stats.syscalls = g_stats.traps = g_stats.icache_f
 
 // ---------- C 端 dispatch (由 naked trap 函数调用) ----------
 // 协议: x0-x5 已作为前 6 个参数, x8 通过 x6 传入 (见 trap 汇编)
-// used: 防止 LTO/strip 优化掉 (naked __isy_syscall_trap 通过汇编 bl 引用)
+// used + 保留指针引用: 防止 LTO 在合并 .o 时消除 (naked 函数的汇编 bl 引用
+// 在 LTO 视角下不可见, 需要一个 C 层面的可见引用)
 __attribute__((visibility("default"), used, noinline))
 int64_t __isy_c_syscall_dispatch(
     uint64_t a0, uint64_t a1, uint64_t a2,
@@ -52,6 +53,11 @@ int64_t __isy_c_syscall_dispatch(
     }
     return g_handler(a0, a1, a2, a3, a4, a5, syscall_nr, cpu);
 }
+
+// LTO 保留锚点: 取函数地址存入 volatile 全局变量, 让编译器在 LTO
+// 合并阶段仍认为此符号有外部引用, 不会被消除
+__attribute__((used))
+volatile uintptr_t __isy_dispatch_anchor = (uintptr_t)&__isy_c_syscall_dispatch;
 
 #ifdef __aarch64__
 
