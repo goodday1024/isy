@@ -119,7 +119,7 @@ final class ProcessManagerTests: XCTestCase {
 
     func testEventHandler() {
         let events = EventCollector()
-        pm.eventHandler = { event in
+        pm.eventHandler = { @Sendable event in
             events.append(event)
         }
         pm.sendSignal(Signal.sigint.rawValue)
