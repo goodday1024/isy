@@ -216,7 +216,8 @@ public extension LinuxProcess {
             return Errno.efault.asSyscallReturn
         }
 
-        // 简化: 遍历已注册的 fd, 检查是否有可读数据
+        // 遍历已注册的 fd, 检查就绪状态
+        // 支持: host fd (poll), pipe, eventfd, timerfd, signalfd
         // 每 10ms 轮询一次, 最多等 timeout ms
         let deadline = timeout > 0 ? Date().addingTimeInterval(Double(timeout) / 1000.0) : Date.distantFuture
         var count: Int32 = 0
@@ -224,42 +225,70 @@ public extension LinuxProcess {
         while count == 0 {
             for (regFd, regEvents, regData) in ep.events {
                 guard count < maxEvents else { break }
-                // 检查 fd 是否有事件
-                var pollFd = pollfd(fd: 0, events: 0, revents: 0)
-                if case .host(let h) = fdTable[regFd] {
-                    pollFd.fd = h
-                } else if case .pipe(let p) = fdTable[regFd] {
-                    // 管道有数据可读
-                    if (regEvents & 1) != 0 && p.count > 0 {
-                        let out = evPtr.advanced(by: Int(count) * 12)
-                        out.assumingMemoryBound(to: UInt32.self).pointee = 1  // EPOLLIN
-                        out.advanced(by: 4).assumingMemoryBound(to: UInt64.self).pointee = regData
-                        count += 1
-                        continue
+                var outEvents: UInt32 = 0
+
+                if let vfd = fdTable[regFd] {
+                    switch vfd {
+                    case .host(let h):
+                        // 宿主 fd: 用 poll 检查
+                        var pollFd = pollfd(fd: h, events: 0, revents: 0)
+                        if (regEvents & 1) != 0 { pollFd.events |= Int16(POLLIN) }   // EPOLLIN
+                        if (regEvents & 4) != 0 { pollFd.events |= Int16(POLLOUT) }  // EPOLLOUT
+                        let r = poll(&pollFd, 1, 0)
+                        if r > 0 {
+                            if (pollFd.revents & Int16(POLLIN)) != 0 { outEvents |= 1 }
+                            if (pollFd.revents & Int16(POLLOUT)) != 0 { outEvents |= 4 }
+                            if (pollFd.revents & Int16(POLLERR)) != 0 { outEvents |= 8 }
+                            if (pollFd.revents & Int16(POLLHUP)) != 0 { outEvents |= 0x10 }
+                        }
+
+                    case .pipe(let p):
+                        // 管道: 检查缓冲区
+                        if (regEvents & 1) != 0 && p.count > 0 { outEvents |= 1 }  // EPOLLIN
+                        if (regEvents & 4) != 0 { outEvents |= 4 }                   // EPOLLOUT
+                        if p.closed { outEvents |= 0x10 }                            // EPOLLHUP
+
+                    case .eventfd(let e):
+                        // eventfd: count > 0 即可读
+                        if (regEvents & 1) != 0 && e.count > 0 { outEvents |= 1 }
+                        if (regEvents & 4) != 0 { outEvents |= 4 }
+
+                    case .timerfd(let t):
+                        // timerfd: 检查是否到期
+                        if (regEvents & 1) != 0 && t.nextExpiry > 0 {
+                            let now = UInt64(Date().timeIntervalSince1970 * 1_000_000_000)
+                            if now >= t.nextExpiry { outEvents |= 1 }
+                        }
+
+                    case .signalfd(let sf):
+                        // signalfd: 检查待处理信号
+                        if (regEvents & 1) != 0 {
+                            let pending = UInt32(bitPattern: pendingSignal)
+                            for sig in 1...31 {
+                                if sf.sigset & (1 << sig) != 0 && pending & (1 << sig) != 0 {
+                                    outEvents |= 1
+                                    break
+                                }
+                            }
+                        }
+
+                    default:
+                        break
                     }
                 }
 
-                if pollFd.fd != 0 {
-                    let r = poll(&pollFd, 1, 0)
-                    if r > 0 && (pollFd.revents & (Int16(POLLIN) | Int16(POLLOUT) | Int16(POLLERR) | Int16(POLLHUP))) != 0 {
-                        var outEvents: UInt32 = 0
-                        if (pollFd.revents & Int16(POLLIN)) != 0 { outEvents |= 1 }
-                        if (pollFd.revents & Int16(POLLOUT)) != 0 { outEvents |= 4 }
-                        if (pollFd.revents & Int16(POLLERR)) != 0 { outEvents |= 8 }
-                        if (pollFd.revents & Int16(POLLHUP)) != 0 { outEvents |= 0x10 }
-                        let out = evPtr.advanced(by: Int(count) * 12)
-                        out.assumingMemoryBound(to: UInt32.self).pointee = outEvents
-                        out.advanced(by: 4).assumingMemoryBound(to: UInt64.self).pointee = regData
-                        count += 1
-                    }
+                if outEvents != 0 {
+                    let out = evPtr.advanced(by: Int(count) * 12)
+                    out.assumingMemoryBound(to: UInt32.self).pointee = outEvents
+                    out.advanced(by: 4).assumingMemoryBound(to: UInt64.self).pointee = regData
+                    count += 1
                 }
             }
 
             if count == 0 {
                 if timeout == 0 { return 0 }
                 if timeout > 0 && Date() >= deadline { return 0 }
-                // 短暂休眠 10ms
-                usleep(10000)
+                usleep(10000)  // 10ms 轮询
             }
         }
         return Int64(count)
@@ -316,8 +345,140 @@ public extension LinuxProcess {
 
     func sys_pselect6(nfds: Int32, readfdsVA: VA, writefdsVA: VA, exceptfdsVA: VA,
                        tspVA: VA, sigmaskVA: VA) -> Int64 {
-        // 简化: 返回 0 (无事件)
-        return 0
+        // pselect6: 将 fd_set 转换为 pollfd 数组, 调用 poll, 再写回 fd_set
+        // Linux fd_set: 每 64 位为一个字, 最多 1024 个 fd
+        let nfdsI = Int(nfds)
+        let fdSetBytes = (nfdsI + 7) / 8
+
+        // 解析 timeout
+        var timeout: Int32 = -1
+        if tspVA.raw != 0, let tsp = addressSpace.hostPointer(for: tspVA, size: 16) {
+            let sec = tsp.assumingMemoryBound(to: Int64.self).pointee
+            let nsec = tsp.advanced(by: 8).assumingMemoryBound(to: Int64.self).pointee
+            timeout = Int32(sec * 1000 + nsec / 1_000_000)
+        }
+
+        // 读取 fd_set
+        var readSet: [UInt8] = []
+        var writeSet: [UInt8] = []
+        if readfdsVA.raw != 0, let rPtr = addressSpace.hostPointer(for: readfdsVA, size: fdSetBytes) {
+            readSet = Array(UnsafeBufferPointer(start: rPtr.assumingMemoryBound(to: UInt8.self), count: fdSetBytes))
+        }
+        if writefdsVA.raw != 0, let wPtr = addressSpace.hostPointer(for: writefdsVA, size: fdSetBytes) {
+            writeSet = Array(UnsafeBufferPointer(start: wPtr.assumingMemoryBound(to: UInt8.self), count: fdSetBytes))
+        }
+
+        // 构建 pollfd 数组
+        var pollFds: [pollfd] = []
+        var fdToIdx: [Int32: Int] = [:]
+
+        for fd in 0..<nfdsI {
+            let byteIdx = fd / 8
+            let bitIdx = fd % 8
+            var events: Int16 = 0
+            if byteIdx < readSet.count && (readSet[byteIdx] & (1 << bitIdx)) != 0 {
+                events |= Int16(POLLIN)
+            }
+            if byteIdx < writeSet.count && (writeSet[byteIdx] & (1 << bitIdx)) != 0 {
+                events |= Int16(POLLOUT)
+            }
+            if events != 0 {
+                var hostFd: Int32 = -1
+                if let vfd = fdTable[Int32(fd)] {
+                    if case .host(let h) = vfd { hostFd = h }
+                    else if case .pipe(let p) = vfd {
+                        // 管道: 用 pollfd.fd = -2 标记为内部管道
+                        hostFd = -2
+                        if (events & Int16(POLLIN)) != 0 && p.count == 0 {
+                            events &= ~Int16(POLLIN)  // 无数据时不检查 POLLIN
+                        }
+                    }
+                }
+                if hostFd != -1 {
+                    fdToIdx[Int32(fd)] = pollFds.count
+                    pollFds.append(pollfd(fd: hostFd, events: events, revents: 0))
+                }
+            }
+        }
+
+        if pollFds.isEmpty { return 0 }
+
+        // 对于管道 fd, 直接检查, 不调用 poll
+        var readyCount: Int32 = 0
+        var pipeReady: [Int32: Int16] = [:]
+
+        for (fd, idx) in fdToIdx {
+            if pollFds[idx].fd == -2 {
+                // 管道 fd
+                if case .pipe(let p) = fdTable[fd] {
+                    var rev: Int16 = 0
+                    if (pollFds[idx].events & Int16(POLLIN)) != 0 && p.count > 0 {
+                        rev |= Int16(POLLIN)
+                    }
+                    if (pollFds[idx].events & Int16(POLLOUT)) != 0 {
+                        rev |= Int16(POLLOUT)  // 管道通常可写
+                    }
+                    if p.closed { rev |= Int16(POLLHUP) }
+                    if rev != 0 { readyCount += 1 }
+                    pipeReady[fd] = rev
+                }
+            }
+        }
+
+        // 对宿主 fd 调用 poll
+        var hostPollFds = pollFds.filter { $0.fd > 0 }
+        if !hostPollFds.isEmpty {
+            let r = hostPollFds.withUnsafeMutableBufferPointer { buf in
+                poll(buf.baseAddress, nfds_t(buf.count), timeout)
+            }
+            if r < 0 { return Errno.fromHost(Int32(errno)).asSyscallReturn }
+            readyCount += Int32(r)
+
+            // 将 revents 写回
+            var hostIdx = 0
+            for (_, idx) in fdToIdx.sorted(by: { $0.value < $1.value }) {
+                if pollFds[idx].fd > 0 && hostIdx < hostPollFds.count {
+                    pollFds[idx].revents = hostPollFds[hostIdx].revents
+                    hostIdx += 1
+                }
+            }
+        }
+
+        // 写回 fd_set
+        if readfdsVA.raw != 0, let rPtr = addressSpace.hostPointer(for: readfdsVA, size: fdSetBytes) {
+            memset(rPtr, 0, fdSetBytes)
+        }
+        if writefdsVA.raw != 0, let wPtr = addressSpace.hostPointer(for: writefdsVA, size: fdSetBytes) {
+            memset(wPtr, 0, fdSetBytes)
+        }
+
+        for (fd, idx) in fdToIdx {
+            let byteIdx = Int(fd) / 8
+            let bitIdx = Int(fd) % 8
+            let rev: Int16
+            if pollFds[idx].fd == -2 {
+                rev = pipeReady[fd] ?? 0
+            } else {
+                rev = pollFds[idx].revents
+            }
+            if (rev & Int16(POLLIN)) != 0 && byteIdx < fdSetBytes {
+                if readfdsVA.raw != 0, let rPtr = addressSpace.hostPointer(for: readfdsVA, size: fdSetBytes) {
+                    rPtr.advanced(by: byteIdx).assumingMemoryBound(to: UInt8.self).pointee |= (1 << bitIdx)
+                }
+            }
+            if (rev & Int16(POLLOUT)) != 0 && byteIdx < fdSetBytes {
+                if writefdsVA.raw != 0, let wPtr = addressSpace.hostPointer(for: writefdsVA, size: fdSetBytes) {
+                    wPtr.advanced(by: byteIdx).assumingMemoryBound(to: UInt8.self).pointee |= (1 << bitIdx)
+                }
+            }
+        }
+
+        // 清空 exceptfds (不支持)
+        if exceptfdsVA.raw != 0, let ePtr = addressSpace.hostPointer(for: exceptfdsVA, size: fdSetBytes) {
+            memset(ePtr, 0, fdSetBytes)
+        }
+
+        return Int64(readyCount)
     }
 
     // MARK: - timerfd
