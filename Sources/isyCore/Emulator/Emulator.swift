@@ -301,24 +301,22 @@ public final class Emulator {
         // mmap hint 参数: Darwin 是 UnsafeMutableRawPointer?, Glibc 是 UnsafeMutableRawPointer?
         // 通过 Int -> bitPattern 转换为指针
         let hint = UnsafeMutableRawPointer(bitPattern: UInt(bitPattern: Int(config.loadBase)))
-        let trampPtr = mmap(
+        let trampPtrOpt = mmap(
             hint,
             trampSize,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
             -1, 0
         )
-        guard trampPtr != MAP_FAILED else {
+        guard trampPtrOpt != MAP_FAILED, let trampPtr = trampPtrOpt else {
             throw ELFError.mmapFailed
         }
 
         // 写入 trampoline 代码
         BinaryPatcher.writeTrampoline(to: trapAddr, at: trampPtr)
 
-        // Flush I-cache
-        #if canImport(Darwin)
-        sys_icache_invalidate(trampPtr, 16)
-        #endif
+        // Flush I-cache (使用 isyCHot 的跨平台实现, 与 Memory.swift 一致)
+        isy_arm64_flush_icache(trampPtr, 16)
 
         // W^X: 切换为 R-X
         mprotect(trampPtr, trampSize, PROT_READ | PROT_EXEC)
