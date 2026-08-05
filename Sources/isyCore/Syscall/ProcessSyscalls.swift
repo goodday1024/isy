@@ -843,15 +843,20 @@ public extension LinuxProcess {
             childDispatcher.registerCoreSyscalls(process: child)
             childDispatcher.install()
 
-            // 在非 arm64 平台模拟执行
-            // 在真实 arm64 平台上, 子进程会从 pc 处开始执行 native 代码
             #if arch(arm64)
             // 子进程在原生执行中继承父进程的 CPU 状态
-            // 实际上 clone 在真实环境中需要复杂的处理
-            // 这里简化: 子进程通过信号量通知父进程已创建
+            // 调用 isy_enter_linux 进入子进程的执行流
+            let entry = child.cpu.pc
+            let stackBase = child.addressSpace.regions.first {
+                if case .stack = $0.backing { return true }
+                return false
+            }?.base
+            _ = isy_enter_linux(UInt(entry), &child.cpu.raw, stackBase)
             #endif
 
-            // 标记子进程初始化完成
+            // 标记子进程已退出
+            childRecord.exited = true
+            childRecord.exitCode = child.exitCode
             childRecord.waitSemaphore.signal()
         }
 
@@ -947,16 +952,48 @@ public extension LinuxProcess {
         // 7. 加载新 ELF 段
         let baseVA = UInt64(0x10000000)
         addressSpace.codeBase = baseVA
+        var execSegments: [(region: MemoryRegion, segIndex: Int, phdr: ELF64ProgramHeader)] = []
         do {
             _ = try elfData.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                try image.loadSegments.forEach { ph in
-                    _ = try addressSpace.loadELFSegment(
-                        data: buf.baseAddress!, phdr: ph, baseVA: baseVA, segIndex: 0
+                for (i, ph) in image.loadSegments.enumerated() {
+                    let region = try addressSpace.loadELFSegment(
+                        data: buf.baseAddress!, phdr: ph, baseVA: baseVA, segIndex: i
                     )
+                    if ph.isExecutable {
+                        execSegments.append((region, i, ph))
+                    }
                 }
             }
         } catch {
             return Errno.enomem.asSyscallReturn
+        }
+
+        // 7.5. Binary patching: SVC #0 -> BL trampoline
+        // 使用 Emulator 的 trampoline 地址 (如果可用)
+        let trampAddr = Emulator.sharedTrampolineVA
+        if trampAddr != 0 {
+            let patchConfig = PatchConfig(trapAddress: trampAddr)
+            var patchTable = PatchTable()
+            for seg in execSegments {
+                let patchStartVA = seg.phdr.vaddr + baseVA
+                let patchByteSize = Int(seg.phdr.filesz)
+                let patchCount = patchByteSize / 4
+                guard let stream = addressSpace.instructionStream(
+                    for: seg.region, baseVA: patchStartVA
+                ) else { continue }
+                let subStream = UnsafeMutableBufferPointer<UInt32>(
+                    start: stream.baseAddress, count: min(patchCount, stream.count)
+                )
+                try? BinaryPatcher.patchSegment(
+                    subStream, baseVA: patchStartVA, config: patchConfig,
+                    segmentIndex: seg.segIndex, into: &patchTable
+                )
+            }
+        }
+
+        // 7.6. W^X: 切换可执行段为 R-X
+        for seg in execSegments {
+            try? addressSpace.makeExecutable(seg.region)
         }
 
         // 8. 构造新的启动栈

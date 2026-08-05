@@ -33,13 +33,74 @@ public final class PipeEnd {
     public var closed: Bool = false
     /// 对端 PipeEnd (用于阻塞读写)
     public weak var peer: PipeEnd?
-    /// 读取等待信号量 (用于阻塞 read)
-    public let readSemaphore = DispatchSemaphore(value: 0)
+    /// 阻塞读写锁 + 条件变量
+    private let cond = NSCondition()
+    /// 是否非阻塞 (O_NONBLOCK)
+    public var nonblocking: Bool = false
+
     public init(capacity: Int = 65536) {
         self.capacity = capacity
         self.buffer = .allocate(capacity: capacity)
     }
     deinit { buffer.deallocate() }
+
+    // MARK: - 阻塞读写
+
+    /// 阻塞读取 (或 EAGAIN 如果 nonblocking)
+    func read(into buf: UnsafeMutableRawPointer, max: Int) -> Int64 {
+        cond.lock()
+        while count == 0 && !closed {
+            if nonblocking {
+                cond.unlock()
+                return -Errno.eagain.asSyscallReturn
+            }
+            cond.wait()
+        }
+        if count == 0 && closed {
+            cond.unlock()
+            return 0  // EOF
+        }
+        let n = min(count, max)
+        memcpy(buf, buffer, n)
+        if n < count {
+            memmove(buffer, buffer.advanced(by: n), count - n)
+        }
+        count -= n
+        cond.signal()  // 唤醒阻塞的 writer
+        cond.unlock()
+        return Int64(n)
+    }
+
+    /// 阻塞写入 (或 EAGAIN 如果 nonblocking)
+    func write(from buf: UnsafeRawPointer, max: Int) -> Int64 {
+        cond.lock()
+        while capacity - count == 0 && !closed {
+            if nonblocking {
+                cond.unlock()
+                return -Errno.eagain.asSyscallReturn
+            }
+            cond.wait()
+        }
+        if closed {
+            cond.unlock()
+            return -Errno.eio.asSyscallReturn
+        }
+        let space = capacity - count
+        let n = min(space, max)
+        memcpy(buffer.advanced(by: count), buf, n)
+        count += n
+        cond.signal()  // 唤醒阻塞的 reader
+        cond.unlock()
+        return Int64(n)
+    }
+
+    /// 关闭管道
+    func close() {
+        cond.lock()
+        closed = true
+        cond.broadcast()  // 唤醒所有等待者
+        cond.unlock()
+    }
 }
 
 public final class EventFD {

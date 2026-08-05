@@ -62,6 +62,20 @@ jobs:
           echo "--- Available iOS SDKs ---"
           xcodebuild -showsdks | grep -i ios || true
 
+      - name: Download ARM64 busybox
+        run: |
+          mkdir -p Sources/isyApp/Resources
+          echo "下载 ARM64 静态 busybox..."
+          curl -fL --retry 3 \
+            https://busybox.net/downloads/binaries/1.36.1-defconfig-multiarch-musl/busybox-aarch64 \
+            -o Sources/isyApp/Resources/busybox
+          chmod +x Sources/isyApp/Resources/busybox
+          echo "busybox 大小: $(stat -f%z Sources/isyApp/Resources/busybox) bytes"
+          # 验证 ELF magic + aarch64
+          file Sources/isyApp/Resources/busybox || true
+          # ELF header 检查: 0x7F 'E' 'L' 'F' + machine=0xB7 (183=aarch64)
+          head -c 20 Sources/isyApp/Resources/busybox | xxd | head -2
+
       - name: Install xcodegen
         run: brew install xcodegen
 

@@ -28,14 +28,17 @@ public final class Emulator {
     /// 动态链接器 (如果主程序是动态链接的)
     public private(set) var dynamicLinker: DynamicLinker?
 
+    /// Trampoline 虚拟地址 (SVC -> BL trampoline -> MOVZ/MOVK/BR __isy_syscall_trap)
+    public private(set) var trampolineVA: UInt64 = 0
+
+    /// 全局共享 trampoline 地址 (供 execve 复用)
+    nonisolated(unsafe) public static var sharedTrampolineVA: UInt64 = 0
+
     public init(config: EmulatorConfig = .default) {
         self.config = config
         self.process = LinuxProcess(pid: 1)
         self.dispatcher = SyscallDispatcher(process: process)
         self.dispatcher.registerCoreSyscalls(process: process)
-        // 调用 LTO 锚点: 在 IR 层面引用所有关键符号,
-        // 防止 Xcode archive 时 LTO 消除 naked 函数 bl 的目标符号.
-        // 返回值是 trap 地址, 与 isy_get_trap_address() 一致.
         _ = isy_runtime_anchor()
     }
 
@@ -49,6 +52,9 @@ public final class Emulator {
     @discardableResult
     public func loadMain(_ data: Data, argv: [String] = [], envp: [String] = [],
                          loadLibrary: ((String) throws -> Data)? = nil) throws -> UInt64 {
+        // 0. 设置 trampoline (解决 BL ±128MB 范围限制)
+        try setupTrampoline()
+
         // 1. 解析 ELF
         let baseVA = config.loadBase
         let image = try ELFParser.parse(data: data, baseAddress: baseVA)
@@ -110,8 +116,7 @@ public final class Emulator {
             )
 
             // 对解释器可执行段做 binary patching
-            let trapAddr = UInt64(isy_get_trap_address())
-            let patchConfig = PatchConfig(trapAddress: trapAddr)
+            let interpPatchConfig = PatchConfig(trapAddress: trampolineVA)
             for seg in interpExecSegments {
                 let patchStartVA = seg.phdr.vaddr + interpBase
                 let patchByteSize = Int(seg.phdr.filesz)
@@ -123,7 +128,7 @@ public final class Emulator {
                     start: stream.baseAddress, count: min(patchCount, stream.count)
                 )
                 try BinaryPatcher.patchSegment(
-                    subStream, baseVA: patchStartVA, config: patchConfig,
+                    subStream, baseVA: patchStartVA, config: interpPatchConfig,
                     segmentIndex: seg.segIndex, into: &patchTable
                 )
             }
@@ -152,8 +157,8 @@ public final class Emulator {
         }
 
         // 4. 对每个可执行段做 binary patching
-        let trapAddr = UInt64(isy_get_trap_address())
-        let patchConfig = PatchConfig(trapAddress: trapAddr)
+        // 使用 trampoline 地址 (而非真实 trap 地址), 解决 BL ±128MB 范围限制
+        let patchConfig = PatchConfig(trapAddress: trampolineVA)
 
         for seg in execSegments {
             // 计算 patch 范围: 只 patch filesz 部分 (memsz 多出的 BSS 不算)
@@ -274,6 +279,52 @@ public final class Emulator {
     private func writeU64(base: UnsafeMutableRawPointer, va: UInt64, stackVA: UInt64, value: UInt64) {
         let off = Int(va - stackVA)
         base.advanced(by: off).assumingMemoryBound(to: UInt64.self).pointee = value
+    }
+
+    /// 设置 trampoline 页面: 在 loadBase 处分配一页, 写入跳转到 __isy_syscall_trap 的代码
+    /// 然后将 loadBase 后移一页, 使 ELF 代码加载在 trampoline 之后
+    /// SVC #0 -> BL trampoline (短距离) -> MOVZ/MOVK/BR __isy_syscall_trap (任意距离)
+    private func setupTrampoline() throws {
+        #if arch(arm64)
+        // 如果已经设置过, 跳过 (execve 复用)
+        if trampolineVA != 0 { return }
+
+        let trapAddr = UInt64(isy_get_trap_address())
+
+        // 在 loadBase 处分配一页 trampoline
+        let trampSize = 0x1000
+        let trampPtr = mmap(
+            UInt(bitPattern: Int(config.loadBase)),
+            trampSize,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1, 0
+        )
+        guard trampPtr != MAP_FAILED else {
+            throw ELFError.mmapFailed
+        }
+
+        // 写入 trampoline 代码
+        BinaryPatcher.writeTrampoline(to: trapAddr, at: trampPtr)
+
+        // Flush I-cache
+        #if canImport(Darwin)
+        sys_icache_invalidate(trampPtr, 16)
+        #endif
+
+        // W^X: 切换为 R-X
+        mprotect(trampPtr, trampSize, PROT_READ | PROT_EXEC)
+
+        trampolineVA = config.loadBase
+        Emulator.sharedTrampolineVA = trampolineVA
+
+        // ELF 代码加载在 trampoline 之后 (loadBase + 0x1000)
+        config.loadBase += UInt64(trampSize)
+        #else
+        // 非 arm64: 不需要 trampoline (不执行原生代码)
+        trampolineVA = config.loadBase
+        Emulator.sharedTrampolineVA = trampolineVA
+        #endif
     }
 
     /// 运行 (只在 arm64 平台可用)

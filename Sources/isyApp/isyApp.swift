@@ -33,9 +33,6 @@ struct ContentView: View {
     @EnvironmentObject var sessionManager: SessionManager
     @State private var showSettings = false
     @State private var showAbout = false
-    @State private var showRealModeInfo = false
-    @State private var showBusyboxInfo = false
-    @State private var isRealMode = false
     @State private var showKeyboardBar = true
     @State private var fontSize: CGFloat = 14
     @State private var terminalRows: Int = 24
@@ -77,29 +74,12 @@ struct ContentView: View {
                         Image(systemName: "plus")
                     }
 
-                    // 启动/停止真实模式
+                    // 重启会话
                     if let session = sessionManager.activeSession {
-                        if session.demoMode {
-                            Menu {
-                                Button {
-                                    startRealMode()
-                                } label: {
-                                    Label("启动真实模式", systemImage: "play.circle")
-                                }
-                                Button {
-                                    showBusyboxInfo = true
-                                } label: {
-                                    Label("关于 busybox", systemImage: "info.circle")
-                                }
-                            } label: {
-                                Image(systemName: "play.circle")
-                            }
-                        } else {
-                            Button {
-                                sessionManager.activeSession?.disconnect()
-                            } label: {
-                                Image(systemName: "stop.circle")
-                            }
+                        Button {
+                            sessionManager.newSession()
+                        } label: {
+                            Image(systemName: "arrow.clockwise.circle")
                         }
                     }
 
@@ -143,18 +123,6 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showAbout) {
                 AboutView()
-            }
-            .alert("真实模式", isPresented: $showRealModeInfo) {
-                Button("确定") { }
-            } message: {
-                Text(isRealMode ?
-                     "真实模式已启动。\n\n正在运行 busybox sh，你可以输入 Linux 命令。\n\n注意: 某些命令需要完整的 rootfs 支持。" :
-                     "真实模式需要:\n1. 在 App bundle 中打包 ARM64 Linux rootfs (Alpine/Debian)\n2. 加载 /bin/sh (或 busybox) ELF\n3. ProcessManager 在后台线程执行\n\n目前使用内置 busybox 兼容模式。")
-            }
-            .alert("Busybox 集成", isPresented: $showBusyboxInfo) {
-                Button("确定") { }
-            } message: {
-                Text("Busybox 是嵌入式 Linux 的标准工具集，将数百个常用命令打包到一个二进制文件中。\n\n集成方式:\n1. 下载 ARM64 busybox 静态二进制\n2. 放入 App bundle Resources\n3. isy 自动加载并运行\n\n当前版本: 使用内置 Shell 提供完整终端体验。\n真实 busybox 需要 ARM64 静态编译的 ELF 文件。")
             }
         }
     }
@@ -234,67 +202,6 @@ struct ContentView: View {
 
     private func clearScreen() {
         sessionManager.activeSession?.clearScreen()
-    }
-
-    private func startRealMode() {
-        guard let session = sessionManager.activeSession else { return }
-
-        isRealMode = true
-        showRealModeInfo = true
-
-        let rootfs = RootFS()
-        let pm = ProcessManager()
-
-        do {
-            try rootfs.mount()
-            session.appendOutput("\u{1B}[32m[RootFS 挂载成功]\u{1B}[0m\n")
-        } catch {
-            session.appendOutput("\u{1B}[33m[RootFS 挂载失败: \(error), 使用最小 rootfs]\u{1B}[0m\n")
-            try? rootfs.mount()
-        }
-
-        session.connect(to: pm)
-
-        if let busyboxData = loadBusybox() {
-            session.appendOutput("\u{1B}[32m[Busybox 加载成功]\u{1B}[0m\n")
-            pm.start(elfData: busyboxData, argv: ["busybox", "sh"], envp: [
-                "PATH=/bin:/usr/bin:/sbin:/usr/sbin",
-                "HOME=/root",
-                "TERM=xterm-256color",
-                "USER=root",
-                "SHELL=/bin/sh",
-                "LANG=C.UTF-8",
-            ], rootfs: rootfs)
-        } else {
-            session.appendOutput("\u{1B}[33m[未找到 busybox, 使用内置完整 Shell]\u{1B}[0m\n")
-            session.appendOutput("\u{1B}[2m[提示: 将 ARM64 busybox 静态二进制放入 App bundle 以启用完整 Linux 环境]\u{1B}[0m\n\n")
-            session.disconnect()
-            session.demoMode = true
-            session.builtinShell = BuiltinShell(rootfs: rootfs)
-        }
-    }
-
-    private func loadBusybox() -> Data? {
-        #if canImport(Darwin) && !os(Linux)
-        if let url = Bundle.main.url(forResource: "busybox", withExtension: nil) {
-            return try? Data(contentsOf: url)
-        }
-        if let url = Bundle.main.url(forResource: "busybox", withExtension: "elf") {
-            return try? Data(contentsOf: url)
-        }
-        #endif
-        let caches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first ?? "/tmp"
-        let paths = [
-            caches + "/isy/busybox",
-            caches + "/isy/rootfs/bin/busybox",
-            caches + "/isy/rootfs/bin/sh",
-        ]
-        for p in paths {
-            if FileManager.default.fileExists(atPath: p) {
-                return try? Data(contentsOf: URL(fileURLWithPath: p))
-            }
-        }
-        return nil
     }
 }
 

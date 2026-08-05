@@ -92,9 +92,9 @@ public final class RootFS: @unchecked Sendable {
         if let archivePath = archivePath {
             try extractArchive(archivePath, to: rootfsPath)
         } else {
-            // 尝试从 bundle 中加载单个 busybox 作为 /bin/busybox
-            try createMinimalRootfs()
+            // 先复制 busybox, 再创建最小 rootfs (后者会为 busybox 创建 applet 符号链接)
             try copyBusyboxIfAvailable()
+            try createMinimalRootfs()
         }
         try? version.write(toFile: versionFile, atomically: true, encoding: .utf8)
         isMounted = true
@@ -437,21 +437,31 @@ public final class RootFS: @unchecked Sendable {
 
     /// 从 bundle 复制 busybox 到 rootfs
     private func copyBusyboxIfAvailable() throws {
+        // 确保 bin 目录存在 (createMinimalRootfs 在本函数之后调用)
+        try mkdirP(rootfsPath + "/bin")
+
         #if canImport(Darwin) && !os(Linux)
         if let url = Bundle.main.url(forResource: "busybox", withExtension: nil) {
             let dest = rootfsPath + "/bin/busybox"
             try? FileManager.default.removeItem(atPath: dest)
             try FileManager.default.copyItem(at: url, to: URL(fileURLWithPath: dest))
             chmod(dest, 0o755)
+            return
         }
         #endif
-        // 从沙盒搜索 busybox
+        // 从沙盒搜索 busybox (用户通过 iTunes 文件共享放入)
         let candidates = [
             sandboxRoot + "/busybox",
             sandboxRoot + "/rootfs/bin/busybox",
         ]
         for c in candidates {
             if FileManager.default.fileExists(atPath: c) {
+                let dest = rootfsPath + "/bin/busybox"
+                if c != dest {
+                    try? FileManager.default.removeItem(atPath: dest)
+                    try FileManager.default.copyItem(atPath: c, toPath: dest)
+                    chmod(dest, 0o755)
+                }
                 return
             }
         }

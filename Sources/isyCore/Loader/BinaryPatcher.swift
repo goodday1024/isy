@@ -177,4 +177,33 @@ public struct BinaryPatcher {
     public static func isBL(_ insn: UInt32) -> Bool {
         (insn & 0xFC000000) == 0x94000000
     }
+
+    // MARK: - Trampoline 支持 (解决 BL ±128MB 范围限制)
+
+    /// 编码 MOVZ Xd, #imm16, lsl #shift
+    public static func encodeMOVZ(_ rd: Int, _ imm16: UInt32, _ shift: Int = 0) -> UInt32 {
+        let hw: UInt32 = UInt32(shift / 16)
+        return 0xD2800000 | (hw << 21) | ((imm16 & 0xFFFF) << 5) | UInt32(rd)
+    }
+
+    /// 编码 MOVK Xd, #imm16, lsl #shift
+    public static func encodeMOVK(_ rd: Int, _ imm16: UInt32, _ shift: Int = 0) -> UInt32 {
+        let hw: UInt32 = UInt32(shift / 16)
+        return 0xF2800000 | (hw << 21) | ((imm16 & 0xFFFF) << 5) | UInt32(rd)
+    }
+
+    /// 编码 BR Xn
+    public static func encodeBR(_ rn: Int) -> UInt32 {
+        0xD61F0000 | (UInt32(rn) << 5)
+    }
+
+    /// 写入 trampoline 代码: 跳转到绝对地址
+    /// 使用 MOVZ + MOVK + MOVK + BR (4 条指令 = 16 字节, 无范围限制)
+    public static func writeTrampoline(to targetAddr: UInt64, at trampPtr: UnsafeMutableRawPointer) {
+        let ptr = trampPtr.assumingMemoryBound(to: UInt32.self)
+        ptr[0] = encodeMOVZ(16, UInt32(targetAddr & 0xFFFF), 0)
+        ptr[1] = encodeMOVK(16, UInt32((targetAddr >> 16) & 0xFFFF), 16)
+        ptr[2] = encodeMOVK(16, UInt32((targetAddr >> 32) & 0xFFFF), 32)
+        ptr[3] = encodeBR(16)
+    }
 }

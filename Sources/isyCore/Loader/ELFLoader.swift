@@ -78,6 +78,7 @@ public enum ELFError: Error {
     case notAarch64
     case truncated
     case invalidProgramHeader
+    case mmapFailed
 }
 
 /// ELF 解析器 (纯逻辑, 不做 I/O)

@@ -595,30 +595,7 @@ extension Errno {
     }
 }
 
-// ---------- PipeEnd / EventFD I/O ----------
-extension PipeEnd {
-    func read(into buf: UnsafeMutableRawPointer, max: Int) -> Int64 {
-        // 简化实现: 真实实现需要锁 + 阻塞
-        if count == 0 { return closed ? 0 : -Errno.eagain.asSyscallReturn }
-        let n = min(count, max)
-        memcpy(buf, buffer, n)
-        if n < count {
-            memmove(buffer, buffer.advanced(by: n), count - n)
-        }
-        count -= n
-        return Int64(n)
-    }
-
-    func write(from buf: UnsafeRawPointer, max: Int) -> Int64 {
-        let space = capacity - count
-        if space == 0 { return -Errno.eagain.asSyscallReturn }
-        let n = min(space, max)
-        memcpy(buffer.advanced(by: count), buf, n)
-        count += n
-        return Int64(n)
-    }
-}
-
+// ---------- EventFD I/O ----------
 extension EventFD {
     func read(into buf: UnsafeMutableRawPointer, max: Int) -> Int64 {
         if max < 8 { return -Errno.einval.asSyscallReturn }
