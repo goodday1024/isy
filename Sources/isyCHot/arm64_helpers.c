@@ -13,6 +13,25 @@
 
 #include <stdio.h>  // snprintf (isy_jit_status)
 
+// ---------- ptrace (iOS JIT 启用) ----------
+// iOS 上 MAP_JIT 要求进程设置 CS_DEBUGGED 标志.
+// 这通常由调试器附加完成, 但我们也可以自己调用 ptrace(PT_TRACE_ME, 0).
+// ptrace 在 iOS SDK 中未声明, 用 syscall 直接调用.
+#if defined(__APPLE__) && defined(__MACH__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <errno.h>
+
+#ifndef PT_TRACE_ME
+#define PT_TRACE_ME 0
+#endif
+
+// SYS_ptrace 在 iOS 上存在但头文件未声明
+#ifndef SYS_ptrace
+#define SYS_ptrace 26
+#endif
+#endif
+
 // ---------- iOS JIT 内存支持 ----------
 // iOS 上执行运行时修改的代码必须使用 MAP_JIT 内存.
 //
@@ -93,6 +112,33 @@ int isy_map_jit_flag(void) {
 #endif
 }
 
+// CS_DEBUGGED 状态: -1=未尝试, 0=失败, 1=成功
+static int isy_jit_cs_debugged = -1;
+
+int isy_enable_jit(void) {
+#if defined(__APPLE__) && defined(__MACH__) && TARGET_OS_IPHONE
+    if (isy_jit_cs_debugged != -1) {
+        return isy_jit_cs_debugged ? 0 : -1;
+    }
+    // 调用 ptrace(PT_TRACE_ME, 0) 设置 CS_DEBUGGED 标志
+    // 这是 MAP_JIT 在 iOS 上工作的必要条件
+    // (iSH/UTM 等项目都用这种方式启用 JIT)
+    errno = 0;
+    long r = syscall(SYS_ptrace, PT_TRACE_ME, 0, 0, 0);
+    if (r == 0) {
+        isy_jit_cs_debugged = 1;
+        return 0;
+    }
+    // ptrace 失败可能是因为: 无 get-task-allow entitlement, 或已在调试器下
+    // 即使失败也继续, MAP_JIT 可能仍可用 (取决于 iOS 版本和签名方式)
+    isy_jit_cs_debugged = 0;
+    return -1;
+#else
+    isy_jit_cs_debugged = 1;  // 非 iOS 平台不需要
+    return 0;
+#endif
+}
+
 const char *isy_jit_status(void) {
     isy_lookup_jit_write_protect();  // 确保已初始化
     static char buf[256];
@@ -107,17 +153,19 @@ const char *isy_jit_status(void) {
     const char *arch = "non-arm64";
 #endif
     snprintf(buf, sizeof(buf),
-             "platform=%s arch=%s map_jit=%d wp_fn=%s (available=%d)",
+             "platform=%s arch=%s map_jit=%d wp_fn=%s (available=%d) cs_debugged=%d",
              platform, arch,
              isy_map_jit_flag(),
              isy_jit_wp_source,
-             isy_jit_wp_available);
+             isy_jit_wp_available,
+             isy_jit_cs_debugged);
     return buf;
 }
 #else
 // Linux/其他平台: 空操作
 void isy_jit_write_protect(int enabled) { (void)enabled; }
 int  isy_map_jit_flag(void) { return 0; }
+int  isy_enable_jit(void) { return 0; }
 const char *isy_jit_status(void) { return "platform=Linux map_jit=0 wp_fn=none"; }
 #endif
 

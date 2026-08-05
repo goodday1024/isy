@@ -45,6 +45,9 @@ public final class Emulator {
         self.dispatcher = SyscallDispatcher(process: process)
         self.dispatcher.registerCoreSyscalls(process: process)
         _ = isy_runtime_anchor()
+        // iOS: 尽早调用 ptrace(PT_TRACE_ME) 设置 CS_DEBUGGED 标志
+        // 这是 mmap MAP_JIT 在 iOS 上工作的必要条件
+        _ = isy_enable_jit()
     }
 
     /// 加载主程序 ELF (支持静态和动态链接)

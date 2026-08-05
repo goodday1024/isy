@@ -112,6 +112,10 @@ int      isy_map_jit_flag(void);
 // 返回 JIT 状态描述字符串 (诊断用)
 // 格式: "platform=iOS map_jit=1 wp_fn=linked" 等
 const char *isy_jit_status(void);
+// 在 iOS 上启用 JIT: 调用 ptrace(PT_TRACE_ME) 设置 CS_DEBUGGED 标志
+// 这是 MAP_JIT 在 iOS 上工作的必要条件 (即使有 allow-jit entitlement)
+// 返回 0=成功, -1=失败
+int      isy_enable_jit(void);
 
 // ---------- 统计 ----------
 typedef struct {
