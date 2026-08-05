@@ -107,8 +107,8 @@ jobs:
         run: |
           mkdir -p build
           # 用 ad-hoc 签名 (-) + entitlements, 让 MAP_JIT 在 iOS 上可用
-          # 关键: 必须保留 com.apple.security.cs.allow-jit 和 get-task-allow
-          # 用户通过 AltStore/Esign 等工具重签时会保留这些 entitlements
+          # 注意: Xcode archive 会自动剥离 com.apple.security.cs.* 等 entitlements,
+          # 所以后面需要手动用 codesign --force 重签以嵌入完整 entitlements
           xcodebuild archive \
             -project isy.xcodeproj \
             -scheme isyApp \
@@ -123,6 +123,20 @@ jobs:
             PROVISIONING_PROFILE_SPECIFIER="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
             ARCHS=arm64
+
+      - name: Re-sign with full entitlements (force embed allow-jit)
+        run: |
+          # Xcode archive 会剥离 com.apple.security.cs.* entitlements
+          # 手动用 codesign --force 重签, 强制嵌入完整 entitlements
+          APP_PATH="build/isy.xcarchive/Products/Applications/isy.app"
+          echo "=== 重签前的 entitlements ==="
+          codesign -d --entitlements - "$APP_PATH" 2>&1 || true
+          echo "=== 手动重签 (ad-hoc + 完整 entitlements) ==="
+          codesign --force --sign - --entitlements Sources/isyApp/isy.entitlements "$APP_PATH"
+          echo "=== 重签后的 entitlements ==="
+          codesign -d --entitlements - "$APP_PATH" 2>&1 || true
+          echo "=== 验证签名 ==="
+          codesign -dv "$APP_PATH" 2>&1 || true
 
       - name: Export unsigned ipa
         run: |
