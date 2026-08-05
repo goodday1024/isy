@@ -269,7 +269,7 @@ public struct TerminalView: View {
         } else {
             Text(buildAttributedLine(from: row))
                 .font(terminalFont)
-                .lineLimit(1)
+                .lineLimit(nil)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 8)
