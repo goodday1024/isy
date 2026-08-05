@@ -13,6 +13,11 @@
 // 平台不支持错误.
 
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 import isyCHot
 
 /// isy 顶层运行时
@@ -293,8 +298,11 @@ public final class Emulator {
 
         // 在 loadBase 处分配一页 trampoline
         let trampSize = 0x1000
+        // mmap hint 参数: Darwin 是 UnsafeMutableRawPointer?, Glibc 是 UnsafeMutableRawPointer?
+        // 通过 Int -> bitPattern 转换为指针
+        let hint = UnsafeMutableRawPointer(bitPattern: UInt(bitPattern: Int(config.loadBase)))
         let trampPtr = mmap(
-            UInt(bitPattern: Int(config.loadBase)),
+            hint,
             trampSize,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
