@@ -16,6 +16,12 @@ settings:
     CLANG_ENABLE_MODULES: YES
     OTHER_LDFLAGS: "-ObjC"
     ENABLE_JIT: YES
+    # SPM 包产物 (isyCore/isyUI/isyCHot) 是静态库, 不需要代码签名
+    # 禁用签名避免与 app target 的 PROVISIONING_PROFILE_SPECIFIER 冲突
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
 
 targets:
   isyApp:
@@ -40,6 +46,7 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         CODE_SIGN_ENTITLEMENTS: Sources/isyApp/isy.entitlements
+        CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGNING_REQUIRED: YES
         CODE_SIGNING_ALLOWED: YES

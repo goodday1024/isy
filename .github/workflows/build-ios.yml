@@ -154,22 +154,39 @@ jobs:
           echo "Team ID: $TEAM_ID"
           echo "Bundle ID: $BUNDLE_ID"
 
+          # 判断证书/profile 类型: Distribution vs Development
+          # Distribution profile 不含 get-task-allow, Development 含
+          CERT_IDENTITY="iPhone Distribution"
+          EXPORT_METHOD="app-store"
+          if grep -q "get-task-allow" $RUNNER_TEMP/profile.plist 2>/dev/null; then
+            CERT_IDENTITY="iPhone Developer"
+            EXPORT_METHOD="development"
+          fi
+          echo "证书类型: $CERT_IDENTITY"
+          echo "导出方法: $EXPORT_METHOD"
+          echo "cert_identity=$CERT_IDENTITY" >> $GITHUB_OUTPUT
+          echo "export_method=$EXPORT_METHOD" >> $GITHUB_OUTPUT
+
       - name: Build archive
         run: |
           mkdir -p build
           SIGN_MODE="${{ steps.signing.outputs.mode }}"
 
           if [ "$SIGN_MODE" = "developer" ]; then
-            echo "=== 使用开发者证书签名 ==="
+            echo "=== 使用开发者证书签名 (${{ steps.signing.outputs.cert_identity }}) ==="
+            # 注意: PROVISIONING_PROFILE_SPECIFIER 等参数只对 app target 生效,
+            # SPM 模块 (isyCore/isyUI/isyCHot) 不需要签名, 但 xcodebuild 会继承
+            # 这些参数导致冲突. 通过 Project.yml 已为 SPM 包设置 CODE_SIGNING_ALLOWED=NO.
             xcodebuild archive \
               -project isy.xcodeproj \
               -scheme isyApp \
               -configuration Release \
               -sdk ${{ steps.sdk.outputs.sdk }} \
               -archivePath build/isy.xcarchive \
-              CODE_SIGN_IDENTITY="iPhone Developer" \
+              CODE_SIGN_IDENTITY="${{ steps.signing.outputs.cert_identity }}" \
               CODE_SIGNING_REQUIRED=YES \
               CODE_SIGNING_ALLOWED=YES \
+              CODE_SIGN_STYLE=Manual \
               CODE_SIGN_ENTITLEMENTS=Sources/isyApp/isy.entitlements \
               DEVELOPMENT_TEAM="${{ steps.signing.outputs.team_id }}" \
               PROVISIONING_PROFILE_SPECIFIER="${{ steps.signing.outputs.profile_uuid }}" \
@@ -186,6 +203,7 @@ jobs:
               CODE_SIGN_IDENTITY="-" \
               CODE_SIGNING_REQUIRED=YES \
               CODE_SIGNING_ALLOWED=YES \
+              CODE_SIGN_STYLE=Manual \
               CODE_SIGN_ENTITLEMENTS=Sources/isyApp/isy.entitlements \
               DEVELOPMENT_TEAM="" \
               PROVISIONING_PROFILE_SPECIFIER="" \
@@ -217,14 +235,14 @@ jobs:
           codesign -dv "$APP_PATH" 2>&1 || true
 
           if [ "$SIGN_MODE" = "developer" ]; then
-            echo "=== 使用开发者证书导出 IPA ==="
+            echo "=== 使用开发者证书导出 IPA (${{ steps.signing.outputs.export_method }}) ==="
             cat > build/export/ExportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
               <key>method</key>
-              <string>development</string>
+              <string>${{ steps.signing.outputs.export_method }}</string>
               <key>signingStyle</key>
               <string>manual</string>
               <key>stripSwiftSymbols</key>
