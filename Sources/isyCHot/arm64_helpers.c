@@ -11,6 +11,35 @@
 
 #include "isy_hot.h"
 
+// ---------- iOS JIT 内存支持 ----------
+// iOS 上执行运行时修改的代码必须使用 MAP_JIT + pthread_jit_write_protect_np.
+// macOS (hardened runtime) 也支持但非强制. Linux 上为空操作.
+#if defined(__APPLE__) && defined(__MACH__)
+#include <pthread.h>
+#include <TargetConditionals.h>
+
+#ifndef MAP_JIT
+#define MAP_JIT 0x8000
+#endif
+
+void isy_jit_write_protect(int enabled) {
+    // enabled=1 -> 可执行 (R-X), enabled=0 -> 可写 (R-W)
+    pthread_jit_write_protect_np(enabled);
+}
+
+int isy_map_jit_flag(void) {
+#if TARGET_OS_IPHONE
+    return MAP_JIT;  // iOS 必须使用 MAP_JIT
+#else
+    return 0;        // macOS 不需要 (mprotect RX 即可)
+#endif
+}
+#else
+// Linux/其他平台: 空操作
+void isy_jit_write_protect(int enabled) { (void)enabled; }
+int  isy_map_jit_flag(void) { return 0; }
+#endif
+
 #ifdef __aarch64__
 
 uint64_t isy_arm64_get_tpidr_el0(void) {

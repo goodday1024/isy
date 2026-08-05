@@ -286,8 +286,8 @@ public final class Emulator {
         base.advanced(by: off).assumingMemoryBound(to: UInt64.self).pointee = value
     }
 
-    /// 设置 trampoline 页面: 在 loadBase 处分配一页, 写入跳转到 __isy_syscall_trap 的代码
-    /// 然后将 loadBase 后移一页, 使 ELF 代码加载在 trampoline 之后
+    /// 设置 trampoline 页面: 分配一页可执行内存, 写入跳转到 __isy_syscall_trap 的代码
+    /// 然后把 loadBase 设为 trampoline 实际地址 + 0x1000, 使 ELF 代码加载在 trampoline 之后
     /// SVC #0 -> BL trampoline (短距离) -> MOVZ/MOVK/BR __isy_syscall_trap (任意距离)
     private func setupTrampoline() throws {
         #if arch(arm64)
@@ -295,37 +295,44 @@ public final class Emulator {
         if trampolineVA != 0 { return }
 
         let trapAddr = UInt64(isy_get_trap_address())
-
-        // 在 loadBase 处分配一页 trampoline
         let trampSize = 0x1000
-        // mmap hint 参数: Darwin 是 UnsafeMutableRawPointer?, Glibc 是 UnsafeMutableRawPointer?
-        // 通过 Int -> bitPattern 转换为指针
-        let hint = UnsafeMutableRawPointer(bitPattern: UInt(bitPattern: Int(config.loadBase)))
-        let trampPtrOpt = mmap(
-            hint,
-            trampSize,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1, 0
-        )
+
+        // iOS: 可执行内存需要 MAP_JIT flag
+        let jitFlag = Int32(isy_map_jit_flag())
+        var flags: Int32 = MAP_PRIVATE | MAP_ANONYMOUS
+        if jitFlag != 0 {
+            flags |= jitFlag
+            isy_jit_write_protect(0)  // 切换为可写以写入 trampoline 代码
+        }
+
+        // 不使用 MAP_FIXED, 让内核选择地址 (iOS 上固定低地址可能不可用)
+        let trampPtrOpt = mmap(nil, trampSize, PROT_READ | PROT_WRITE, flags, -1, 0)
         guard trampPtrOpt != MAP_FAILED, let trampPtr = trampPtrOpt else {
+            if jitFlag != 0 { isy_jit_write_protect(1) }
             throw ELFError.mmapFailed
         }
 
-        // 写入 trampoline 代码
+        // 使用 mmap 返回的实际地址 (而非 config.loadBase)
+        let actualAddr = UInt64(UInt(bitPattern: trampPtr))
+
+        // 写入 trampoline 代码 (MOVZ/MOVK/BR __isy_syscall_trap)
         BinaryPatcher.writeTrampoline(to: trapAddr, at: trampPtr)
 
-        // Flush I-cache (使用 isyCHot 的跨平台实现, 与 Memory.swift 一致)
+        // Flush I-cache + 切换为可执行
         isy_arm64_flush_icache(trampPtr, 16)
+        if jitFlag != 0 {
+            isy_jit_write_protect(1)  // iOS: 切换为可执行
+        } else {
+            // macOS/Linux: mprotect 切换为 R-X
+            mprotect(trampPtr, trampSize, PROT_READ | PROT_EXEC)
+        }
 
-        // W^X: 切换为 R-X
-        mprotect(trampPtr, trampSize, PROT_READ | PROT_EXEC)
-
-        trampolineVA = config.loadBase
+        trampolineVA = actualAddr
         Emulator.sharedTrampolineVA = trampolineVA
 
-        // ELF 代码加载在 trampoline 之后 (loadBase + 0x1000)
-        config.loadBase += UInt64(trampSize)
+        // ELF 代码加载在 trampoline 之后 (实际地址 + 0x1000)
+        // 这样 BL 从 ELF 代码到 trampoline 的距离 <= 0x1000 + segSize, 远在 ±128MB 内
+        config.loadBase = actualAddr + UInt64(trampSize)
         #else
         // 非 arm64: 不需要 trampoline (不执行原生代码)
         trampolineVA = config.loadBase
@@ -343,6 +350,8 @@ public final class Emulator {
             if case .stack = $0.backing { return true }
             return false
         }?.base
+        // iOS: 确保 JIT 内存处于可执行模式 (pthread_jit_write_protect_np(1))
+        isy_jit_write_protect(1)
         let r = isy_enter_linux(UInt(entry), &process.cpu.raw, stackBase)
         return Int32(truncatingIfNeeded: r)
         #else
@@ -360,12 +369,12 @@ public final class Emulator {
 
 /// Emulator 配置
 public struct EmulatorConfig: Sendable {
-    /// Linux 代码加载基址 (PIE)
-    public var loadBase: UInt64 = 0x10000000   // 256MB
+    /// Linux 代码加载基址 (PIE) - 实际由 setupTrampoline 中 mmap 返回地址决定
+    public var loadBase: UInt64 = 0x10000000   // 初始 hint, 会被 trampoline 实际地址覆盖
     /// 解释器 (ld-linux) 加载基址
     public var interpBase: UInt64 = 0x20000000  // 512MB
-    /// 主线程栈基址
-    public var stackBase: UInt64 = 0x70000000_00000000  // 7TB (iOS 高地址区)
+    /// 主线程栈基址 (0 = 让内核选择, iOS 上固定高地址可能不可用)
+    public var stackBase: UInt64 = 0
     /// 栈大小
     public var stackSize: Int = 8 * 1024 * 1024  // 8MB
     /// 是否启用 MRS/MSR trap (第一版关闭)

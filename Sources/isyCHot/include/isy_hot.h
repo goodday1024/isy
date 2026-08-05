@@ -95,6 +95,21 @@ uint64_t isy_arm64_get_cntvct(void);   // 虚拟计数器
 void     isy_arm64_flush_icache(void *addr, size_t len);
 void     isy_arm64_dc_cvau(void *addr, size_t len);  // D-cache clean to PoU
 
+// ---------- iOS JIT 内存支持 ----------
+// iOS 上执行运行时修改的代码 (binary patching 后的 ELF) 必须使用 MAP_JIT
+// flag 创建映射, 并通过 pthread_jit_write_protect_np 切换 W/X 状态.
+// macOS 和 Linux 上这些是空操作.
+//
+// 使用流程:
+//   1. isy_mmap_exec(size) -> 用 MAP_JIT 分配可执行内存 (返回地址)
+//   2. isy_jit_write_protect(0) -> 切换为可写
+//   3. 写入/修改代码
+//   4. isy_jit_write_protect(1) -> 切换为可执行
+//   5. isy_arm64_flush_icache(addr, len) -> flush I-cache
+void     isy_jit_write_protect(int enabled);  // 0=可写, 1=可执行
+// 返回 MAP_JIT flag 值 (iOS=0x8000, 其他平台=0)
+int      isy_map_jit_flag(void);
+
 // ---------- 统计 ----------
 typedef struct {
     uint64_t syscalls;

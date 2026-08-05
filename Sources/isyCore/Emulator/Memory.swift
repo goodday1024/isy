@@ -124,15 +124,25 @@ public final class LinuxAddressSpace {
         let mapSize = pageEnd - pageStart
 
         // 段权限: 先 RW (要写内容 + patch), 后续通过 makeExecutable 改 R/RX
+        // iOS: 可执行段必须用 MAP_JIT flag, 否则执行运行时修改的代码会 crash
+        let isExec = phdr.isExecutable
         var posixProt: Int32 = PROT_READ | PROT_WRITE
-        if phdr.isExecutable { posixProt |= PROT_EXEC }  // 暂时不开 exec, patch 后再开
+        // 不在此处加 PROT_EXEC, patch 完成后由 makeExecutable 开启
+
+        var flags: Int32 = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED
+        if isExec {
+            // iOS 可执行段: 添加 MAP_JIT flag
+            flags |= Int32(isy_map_jit_flag())
+            // iOS MAP_JIT 内存: 切换为可写模式以加载代码
+            isy_jit_write_protect(0)
+        }
 
         let va = baseVA + UInt64(pageStart)
-        let flags: Int32 = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED
         let hintPtr = UnsafeMutableRawPointer(bitPattern: UInt(va))
         let mmapResult = mmap(hintPtr, mapSize, posixProt, flags, -1, 0)
         guard let ptr = mmapResult,
               ptr != UnsafeMutableRawPointer(bitPattern: UInt.max) else {
+            if isExec { isy_jit_write_protect(1) }  // 恢复
             throw MemoryError.mmapFailed(errno: errno)
         }
 
@@ -147,6 +157,10 @@ public final class LinuxAddressSpace {
             memset(ptr.advanced(by: bssStart), 0, bssEnd - bssStart)
         }
 
+        // iOS: 写入完成, 保持可写状态 (binary patching 还需要写入)
+        // makeExecutable 会在 patch 完成后切换为可执行
+        // 注意: isy_jit_write_protect(0) 已在上方调用, 保持可写
+
         let region = MemoryRegion(
             base: ptr, size: mapSize,
             prot: ProtFlags(rawValue: Int32(phdr.flags & 7)),
@@ -160,11 +174,19 @@ public final class LinuxAddressSpace {
 
     /// 把一个区域改为只读+可执行 (patch 完成后调用, 实现 W^X)
     public func makeExecutable(_ region: MemoryRegion) throws {
-        var posixProt: Int32 = PROT_READ
-        if region.prot.contains(.exec) { posixProt |= PROT_EXEC }
-        let r = mprotect(region.base, region.size, posixProt)
-        if r != 0 {
-            throw MemoryError.mprotectFailed(errno: errno, addr: region.vaBase, size: region.size)
+        let jitFlag = isy_map_jit_flag()
+        if jitFlag != 0 {
+            // iOS (MAP_JIT): 权限由 pthread_jit_write_protect_np 控制, 不用 mprotect
+            // binary patching 已在 isy_jit_write_protect(0) 下完成, 现在切换为可执行
+            isy_jit_write_protect(1)
+        } else {
+            // macOS/Linux: 用 mprotect 切换为 R-X
+            var posixProt: Int32 = PROT_READ
+            if region.prot.contains(.exec) { posixProt |= PROT_EXEC }
+            let r = mprotect(region.base, region.size, posixProt)
+            if r != 0 {
+                throw MemoryError.mprotectFailed(errno: errno, addr: region.vaBase, size: region.size)
+            }
         }
         // flush I-cache (自修改代码必须!)
         isy_arm64_flush_icache(region.base, region.size)

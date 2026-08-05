@@ -61,7 +61,12 @@ public final class SessionManager: ObservableObject {
 
     /// 启动真实模式: 加载 busybox 并执行 sh
     private func bootRealMode(session: TerminalModel) {
-        guard let rfs = rootfs else { return }
+        guard let rfs = rootfs else {
+            session.appendOutput("\u{1B}[31m[错误] RootFS 未初始化\u{1B}[0m\n")
+            return
+        }
+
+        session.appendOutput("\u{1B}[2m[1/4] RootFS 就绪: \(rfs.rootfsPath)\u{1B}[0m\n")
 
         // 查找 busybox 二进制
         guard let busyboxData = loadBusybox() else {
@@ -73,6 +78,8 @@ public final class SessionManager: ObservableObject {
             session.prompt = "isy$ "
             return
         }
+
+        session.appendOutput("\u{1B}[2m[2/4] busybox 已加载: \(busyboxData.count) bytes\u{1B}[0m\n")
 
         // 创建 ProcessManager 并连接
         let pm = ProcessManager()
@@ -88,6 +95,7 @@ public final class SessionManager: ObservableObject {
             "LANG=C.UTF-8",
             "PS1=\\w # "
         ]
+        session.appendOutput("\u{1B}[2m[3/4] 启动 ELF 加载 + binary patching...\u{1B}[0m\n")
         pm.start(
             elfData: busyboxData,
             argv: ["/bin/sh"],

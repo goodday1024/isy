@@ -950,7 +950,14 @@ public extension LinuxProcess {
         addressSpace.removeAllRegions()
 
         // 7. 加载新 ELF 段
-        let baseVA = UInt64(0x10000000)
+        // 使用 trampoline 实际地址 + 0x1000 作为基址 (与 Emulator.loadMain 一致)
+        // 如果 trampoline 未设置, fallback 到 0x10000000
+        let baseVA: UInt64
+        if Emulator.sharedTrampolineVA != 0 {
+            baseVA = Emulator.sharedTrampolineVA + 0x1000
+        } else {
+            baseVA = 0x10000000
+        }
         addressSpace.codeBase = baseVA
         var execSegments: [(region: MemoryRegion, segIndex: Int, phdr: ELF64ProgramHeader)] = []
         do {
@@ -996,9 +1003,9 @@ public extension LinuxProcess {
             try? addressSpace.makeExecutable(seg.region)
         }
 
-        // 8. 构造新的启动栈
+        // 8. 构造新的启动栈 (不固定地址, 让内核选择)
         let stackSize = 8 * 1024 * 1024
-        let stackBase: UInt64 = 0x70000000_00000000
+        let stackBase: UInt64 = 0  // 0 = 让内核选择地址
         do {
             let stackRegion = try addressSpace.allocateAnonymous(
                 size: stackSize, prot: [.read, .write],
