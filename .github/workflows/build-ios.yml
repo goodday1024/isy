@@ -103,31 +103,100 @@ jobs:
           echo "Resolved SDK: $SDK"
           echo "sdk=$SDK" >> $GITHUB_OUTPUT
 
-      - name: Build archive (ad-hoc signed with entitlements)
+      - name: Setup code signing
+        id: signing
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [ -z "$BUILD_CERTIFICATE_BASE64" ]; then
+            echo "mode=adhoc" >> $GITHUB_OUTPUT
+            echo "未配置开发者证书, 使用 ad-hoc 签名 (entitlements 不会生效)"
+            exit 0
+          fi
+
+          echo "mode=developer" >> $GITHUB_OUTPUT
+          echo "检测到开发者证书, 使用开发者签名 (entitlements 会生效)"
+
+          # 创建临时 keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain-db
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # 导入证书
+          echo $BUILD_CERTIFICATE_BASE64 | base64 --decode > $RUNNER_TEMP/cert.p12
+          security import $RUNNER_TEMP/cert.p12 -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH login.keychain-db
+
+          # 安装 provisioning profile
+          echo $BUILD_PROVISION_PROFILE_BASE64 | base64 --decode > $RUNNER_TEMP/profile.mobileprovision
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $RUNNER_TEMP/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+
+          # 从 provisioning profile 提取信息
+          security cms -D -i $RUNNER_TEMP/profile.mobileprovision > $RUNNER_TEMP/profile.plist
+          PP_UUID=$(plutil -extract UUID raw $RUNNER_TEMP/profile.plist)
+          APP_ID=$(plutil -extract Entitlements.application-identifier raw $RUNNER_TEMP/profile.plist)
+          TEAM_ID="${APP_ID%%.*}"
+          BUNDLE_ID="${APP_ID#*.}"
+          # 通配符 profile 时保留原 bundle ID
+          if [ "$BUNDLE_ID" = "*" ]; then
+            BUNDLE_ID="app.isy.ios"
+          fi
+
+          echo "profile_uuid=$PP_UUID" >> $GITHUB_OUTPUT
+          echo "team_id=$TEAM_ID" >> $GITHUB_OUTPUT
+          echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
+          echo "Provisioning Profile UUID: $PP_UUID"
+          echo "Team ID: $TEAM_ID"
+          echo "Bundle ID: $BUNDLE_ID"
+
+      - name: Build archive
         run: |
           mkdir -p build
-          # 用 ad-hoc 签名 (-) + entitlements, 让 MAP_JIT 在 iOS 上可用
-          # 注意: Xcode archive 会自动剥离 com.apple.security.cs.* 等 entitlements,
-          # 所以后面需要手动用 codesign --force 重签以嵌入完整 entitlements
-          xcodebuild archive \
-            -project isy.xcodeproj \
-            -scheme isyApp \
-            -configuration Release \
-            -sdk ${{ steps.sdk.outputs.sdk }} \
-            -archivePath build/isy.xcarchive \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=YES \
-            CODE_SIGNING_ALLOWED=YES \
-            CODE_SIGN_ENTITLEMENTS=Sources/isyApp/isy.entitlements \
-            DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            ARCHS=arm64
+          SIGN_MODE="${{ steps.signing.outputs.mode }}"
 
-      - name: Re-sign with full entitlements (force embed allow-jit)
+          if [ "$SIGN_MODE" = "developer" ]; then
+            echo "=== 使用开发者证书签名 ==="
+            xcodebuild archive \
+              -project isy.xcodeproj \
+              -scheme isyApp \
+              -configuration Release \
+              -sdk ${{ steps.sdk.outputs.sdk }} \
+              -archivePath build/isy.xcarchive \
+              CODE_SIGN_IDENTITY="iPhone Developer" \
+              CODE_SIGNING_REQUIRED=YES \
+              CODE_SIGNING_ALLOWED=YES \
+              CODE_SIGN_ENTITLEMENTS=Sources/isyApp/isy.entitlements \
+              DEVELOPMENT_TEAM="${{ steps.signing.outputs.team_id }}" \
+              PROVISIONING_PROFILE_SPECIFIER="${{ steps.signing.outputs.profile_uuid }}" \
+              PRODUCT_BUNDLE_IDENTIFIER="${{ steps.signing.outputs.bundle_id }}" \
+              ARCHS=arm64
+          else
+            echo "=== 使用 ad-hoc 签名 (无证书回退) ==="
+            xcodebuild archive \
+              -project isy.xcodeproj \
+              -scheme isyApp \
+              -configuration Release \
+              -sdk ${{ steps.sdk.outputs.sdk }} \
+              -archivePath build/isy.xcarchive \
+              CODE_SIGN_IDENTITY="-" \
+              CODE_SIGNING_REQUIRED=YES \
+              CODE_SIGNING_ALLOWED=YES \
+              CODE_SIGN_ENTITLEMENTS=Sources/isyApp/isy.entitlements \
+              DEVELOPMENT_TEAM="" \
+              PROVISIONING_PROFILE_SPECIFIER="" \
+              AD_HOC_CODE_SIGNING_ALLOWED=YES \
+              ARCHS=arm64
+          fi
+
+      - name: Re-sign with full entitlements (ad-hoc fallback only)
+        if: steps.signing.outputs.mode != 'developer'
         run: |
-          # Xcode archive 会剥离 com.apple.security.cs.* entitlements
-          # 手动用 codesign --force 重签, 强制嵌入完整 entitlements
+          # 仅在 ad-hoc 模式下重签 (开发者模式已正确签名)
           APP_PATH="build/isy.xcarchive/Products/Applications/isy.app"
           echo "=== 重签前的 entitlements ==="
           codesign -d --entitlements - "$APP_PATH" 2>&1 || true
@@ -135,18 +204,21 @@ jobs:
           codesign --force --sign - --entitlements Sources/isyApp/isy.entitlements "$APP_PATH"
           echo "=== 重签后的 entitlements ==="
           codesign -d --entitlements - "$APP_PATH" 2>&1 || true
+
+      - name: Export IPA
+        run: |
+          mkdir -p build/export
+          SIGN_MODE="${{ steps.signing.outputs.mode }}"
+          APP_PATH="build/isy.xcarchive/Products/Applications/isy.app"
+
+          echo "=== 验证 entitlements ==="
+          codesign -d --entitlements - "$APP_PATH" 2>&1 || true
           echo "=== 验证签名 ==="
           codesign -dv "$APP_PATH" 2>&1 || true
 
-      - name: Export unsigned ipa
-        run: |
-          mkdir -p build/export
-          # 验证 entitlements 已嵌入二进制
-          echo "=== 验证 entitlements ==="
-          codesign -d --entitlements - build/isy.xcarchive/Products/Applications/isy.app 2>&1 || true
-          echo "=== 验证代码签名 ==="
-          codesign -dv build/isy.xcarchive/Products/Applications/isy.app 2>&1 || true
-          cat > build/export/ExportOptions.plist <<'EOF'
+          if [ "$SIGN_MODE" = "developer" ]; then
+            echo "=== 使用开发者证书导出 IPA ==="
+            cat > build/export/ExportOptions.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -158,24 +230,26 @@ jobs:
               <key>stripSwiftSymbols</key>
               <true/>
               <key>teamID</key>
-              <string></string>
+              <string>${{ steps.signing.outputs.team_id }}</string>
               <key>compileBitcode</key>
               <false/>
-              <key>thinning</key>
-              <string></string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>${{ steps.signing.outputs.bundle_id }}</key>
+                  <string>${{ steps.signing.outputs.profile_uuid }}</string>
+              </dict>
           </dict>
           </plist>
           EOF
-          xcodebuild -exportArchive \
-            -archivePath build/isy.xcarchive \
-            -exportPath build/export \
-            -exportOptionsPlist build/export/ExportOptions.plist \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=YES \
-            CODE_SIGNING_ALLOWED=YES || true
-          # 如果 export 失败 (无签名证书), 用 zip 手动打 ipa (保留已嵌入的 entitlements)
+            xcodebuild -exportArchive \
+              -archivePath build/isy.xcarchive \
+              -exportPath build/export \
+              -exportOptionsPlist build/export/ExportOptions.plist || true
+          fi
+
+          # 如果 export 失败或 ad-hoc 模式, 用 zip 打包
           if [ ! -f build/export/isy.ipa ]; then
-            echo "exportArchive 失败 (无开发证书), 改用 zip 打包 Payload (保留 ad-hoc 签名和 entitlements)"
+            echo "exportArchive 未生成 IPA, 改用 zip 打包"
             cd build
             mkdir -p Payload
             cp -r isy.xcarchive/Products/Applications/isy.app Payload/
