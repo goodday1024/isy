@@ -204,7 +204,22 @@ public final class Emulator {
             // 可执行段会被正确执行, 数据段的写操作需要在 isy_jit_write_protect(0) 下进行
             // (简化: 假设 busybox 静态二进制的数据段在执行期间不需要频繁写入)
         } else {
-            // macOS/Linux: 对每个段单独 mprotect
+            // 非 MAP_JIT 路径 (macOS 或 iOS ptrace 失败时):
+            // 用 mprotect 切换权限, 依赖 com.apple.security.cs.allow-unsigned-executable-memory
+            // 1. 先 mprotect trampoline 页面为 R-X
+            if let blockPtr = trampBlockPtr {
+                let trampSize = 0x1000
+                errno = 0
+                let r = mprotect(blockPtr, trampSize, PROT_READ | PROT_EXEC)
+                if r != 0 {
+                    let e = errno
+                    throw ELFError.mprotectFailed(
+                        errno: e, addr: UInt64(UInt(bitPattern: blockPtr)), size: trampSize,
+                        context: "loadMain trampoline prot=0x\(String(PROT_READ | PROT_EXEC, radix: 16))"
+                    )
+                }
+            }
+            // 2. 对每个 ELF 段单独 mprotect
             for seg in allSegments {
                 var segProt: Int32 = PROT_READ
                 if seg.phdr.isExecutable { segProt |= PROT_EXEC }

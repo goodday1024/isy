@@ -99,21 +99,28 @@ void isy_jit_write_protect(int enabled) {
     }
 }
 
+// CS_DEBUGGED 状态: -1=未尝试, 0=失败, 1=成功
+static int isy_jit_cs_debugged = -1;
+
 int isy_map_jit_flag(void) {
 #if TARGET_OS_IPHONE
-    // iOS: 必须使用 MAP_JIT 才能执行运行时修改的代码.
-    // 即使 pthread_jit_write_protect_np 不可用, MAP_JIT 内存仍可用:
-    // iOS 17+ 上带 com.apple.security.cs.allow-jit entitlement 时,
-    // MAP_JIT 内存的 W/X 切换由系统自动处理.
-    return MAP_JIT;
+    // iOS: MAP_JIT 只有在 CS_DEBUGGED 标志设置后才能工作.
+    // 如果 ptrace(PT_TRACE_ME) 失败 (现代 iOS 上常被沙盒拦截),
+    // 则不使用 MAP_JIT, 改用 mprotect(PROT_EXEC) +
+    // com.apple.security.cs.allow-unsigned-executable-memory entitlement.
+    if (isy_jit_cs_debugged == 1) {
+        return MAP_JIT;
+    }
+    // ptrace 失败或未调用: 不使用 MAP_JIT, 依赖 allow-unsigned-executable-memory
+    return 0;
 #else
     // macOS: 不需要 MAP_JIT (mprotect RX 即可)
     return 0;
 #endif
 }
 
-// CS_DEBUGGED 状态: -1=未尝试, 0=失败, 1=成功
-static int isy_jit_cs_debugged = -1;
+// ptrace 失败时的 errno (诊断用)
+static int isy_jit_ptrace_errno = 0;
 
 int isy_enable_jit(void) {
 #if defined(__APPLE__) && defined(__MACH__) && TARGET_OS_IPHONE
@@ -129,8 +136,8 @@ int isy_enable_jit(void) {
         isy_jit_cs_debugged = 1;
         return 0;
     }
-    // ptrace 失败可能是因为: 无 get-task-allow entitlement, 或已在调试器下
-    // 即使失败也继续, MAP_JIT 可能仍可用 (取决于 iOS 版本和签名方式)
+    // ptrace 失败: 记录 errno, 回退到 mprotect + allow-unsigned-executable-memory
+    isy_jit_ptrace_errno = errno;
     isy_jit_cs_debugged = 0;
     return -1;
 #else
@@ -153,12 +160,13 @@ const char *isy_jit_status(void) {
     const char *arch = "non-arm64";
 #endif
     snprintf(buf, sizeof(buf),
-             "platform=%s arch=%s map_jit=%d wp_fn=%s (available=%d) cs_debugged=%d",
+             "platform=%s arch=%s map_jit=%d wp_fn=%s (available=%d) cs_debugged=%d ptrace_errno=%d",
              platform, arch,
              isy_map_jit_flag(),
              isy_jit_wp_source,
              isy_jit_wp_available,
-             isy_jit_cs_debugged);
+             isy_jit_cs_debugged,
+             isy_jit_ptrace_errno);
     return buf;
 }
 #else
