@@ -13,25 +13,48 @@
 
 // ---------- iOS JIT 内存支持 ----------
 // iOS 上执行运行时修改的代码必须使用 MAP_JIT + pthread_jit_write_protect_np.
+// 但 pthread_jit_write_protect_np 在 iOS SDK 中被标记为 unavailable,
+// 需要用 dlsym 动态查找来绕过编译时检查.
 // macOS (hardened runtime) 也支持但非强制. Linux 上为空操作.
 #if defined(__APPLE__) && defined(__MACH__)
-#include <pthread.h>
+#include <dlfcn.h>
 #include <TargetConditionals.h>
 
 #ifndef MAP_JIT
 #define MAP_JIT 0x8000
 #endif
 
+// 用 dlsym 动态查找 pthread_jit_write_protect_np, 绕过 SDK 的 unavailable 标记
+typedef void (*isy_jit_write_protect_fn)(int);
+static isy_jit_write_protect_fn isy_lookup_jit_write_protect(void) {
+    static isy_jit_write_protect_fn func = NULL;
+    static bool initialized = false;
+    if (!initialized) {
+        func = (isy_jit_write_protect_fn)dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
+        initialized = true;
+    }
+    return func;
+}
+
 void isy_jit_write_protect(int enabled) {
     // enabled=1 -> 可执行 (R-X), enabled=0 -> 可写 (R-W)
-    pthread_jit_write_protect_np(enabled);
+    isy_jit_write_protect_fn func = isy_lookup_jit_write_protect();
+    if (func) {
+        func(enabled);
+    }
+    // 如果函数不可用 (无 entitlement), 静默忽略
 }
 
 int isy_map_jit_flag(void) {
+    // 只有在 pthread_jit_write_protect_np 可用时才使用 MAP_JIT
+    // 否则回退到普通的 mmap RW -> mprotect RX 路径
 #if TARGET_OS_IPHONE
-    return MAP_JIT;  // iOS 必须使用 MAP_JIT
+    if (isy_lookup_jit_write_protect() != NULL) {
+        return MAP_JIT;  // iOS 真机 + 有 entitlement: 使用 MAP_JIT
+    }
+    return 0;  // iOS 模拟器或无 entitlement: 不使用 MAP_JIT
 #else
-    return 0;        // macOS 不需要 (mprotect RX 即可)
+    return 0;  // macOS 不需要 MAP_JIT (mprotect RX 即可)
 #endif
 }
 #else
