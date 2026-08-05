@@ -113,8 +113,11 @@ open isy.xcodeproj
 | P1 | VT100/xterm ANSI 终端模拟器 | ✅ 完成 |
 | P1 | iOS App UI (键盘工具栏/设置/关于页/会话) | ✅ 完成 |
 | P1 | GitHub Action CI/CD (Linux 测试 + iOS IPA 构建) | ✅ 完成 |
-| P2 | epoll/poll (kqueue 后端) | 📋 TODO |
-| P2 | 真实模式 stdio 桥接 (跑通 `ls`/`cat`) | 🔨 进行中 |
+| P1 | 动态字号终端 + AttributedString 整行渲染 | ✅ 完成 |
+| P2 | epoll (多fd类型就绪检查: host/pipe/eventfd/timerfd/signalfd) | ✅ 完成 |
+| P2 | pselect6 (fd_set ↔ pollfd 转换) | ✅ 完成 |
+| P2 | poll/ppoll (宿主 poll + 管道就绪) | ✅ 完成 |
+| P2 | 真实模式 stdio 桥接 (pipe fd 0/1/2) | ✅ 完成 |
 | P3 | Metal offload (GPU SIMD) | 📋 TODO |
 | P3 | AMX wrapper (矩阵加速) | 📋 TODO |
 
