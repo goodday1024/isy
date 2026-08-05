@@ -34,6 +34,21 @@ public struct TerminalView: View {
         fontSize * 1.35
     }
 
+    /// 只渲染有内容的行 + 光标行, 跳过尾部空行
+    private var visibleRows: [([TerminalCell], Int)] {
+        let grid = model.buffer.grid
+        // 找到最后一个有内容的行
+        var lastNonEmpty = -1
+        for (i, row) in grid.enumerated() {
+            if !row.allSatisfy({ $0.char == " " }) {
+                lastNonEmpty = i
+            }
+        }
+        // 渲染 0...lastNonEmpty 行 (至少渲染 0 行, 即输入行紧跟在 banner 后)
+        let endIdx = max(lastNonEmpty + 1, 0)
+        return (0..<endIdx).map { i in (grid[i], i) }
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             // 工具栏
@@ -45,8 +60,9 @@ public struct TerminalView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(model.buffer.grid.enumerated()), id: \.offset) { rowIdx, row in
-                            rowView(row: row, rowIdx: rowIdx)
+                        // 只渲染有内容的行
+                        ForEach(visibleRows, id: \.1) { row, rowIdx in
+                            rowView(row: row)
                                 .id("row-\(rowIdx)")
                         }
                         // 当前输入行
@@ -93,29 +109,42 @@ public struct TerminalView: View {
                         }
                         .id("input-line")
                         .padding(.horizontal, 8)
-                        .frame(height: lineHeight)
+                        .frame(minHeight: lineHeight)
                     }
-                    .padding(.vertical, 8)
+                    .padding(.vertical, 4)
                 }
                 .background(Color.black)
+                // 点击空白区域时重新聚焦 TextField (保持键盘)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    inputFocused = true
+                }
                 .onChange(of: model.linesVersion) { _, _ in
                     withAnimation(.easeOut(duration: 0.05)) {
                         proxy.scrollTo("input-line", anchor: .bottom)
                     }
                 }
                 .onAppear {
-                    inputFocused = true
-                    proxy.scrollTo("input-line", anchor: .bottom)
+                    // 延迟聚焦, 等布局完成
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        inputFocused = true
+                        proxy.scrollTo("input-line", anchor: .bottom)
+                    }
                 }
-                // 手势
-                .onTapGesture(count: 2) {
-                    // 双击: 显示工具栏
-                    withAnimation { showToolbar.toggle() }
-                }
-                .onLongPressGesture(minimumDuration: 0.5) {
-                    // 长按: 复制最后一行
-                    copyLastLine()
-                }
+                // 双击显示工具栏 (用 simultaneousGesture 避免干扰 TextField)
+                .simultaneousGesture(
+                    TapGesture(count: 2)
+                        .onEnded {
+                            withAnimation { showToolbar.toggle() }
+                        }
+                )
+                // 长按复制
+                .simultaneousGesture(
+                    LongPressGesture(minimumDuration: 0.8)
+                        .onEnded { _ in
+                            copyLastLine()
+                        }
+                )
                 // 右键菜单 (iPad 外接鼠标)
                 .contextMenu {
                     Button {
@@ -201,7 +230,7 @@ public struct TerminalView: View {
     // MARK: - 整行渲染 (AttributedString)
 
     @ViewBuilder
-    private func rowView(row: [TerminalCell], rowIdx: Int) -> some View {
+    private func rowView(row: [TerminalCell]) -> some View {
         if row.allSatisfy({ $0.char == " " }) {
             // 空行: 占位
             Color.clear
