@@ -71,14 +71,35 @@ public struct ELFImage {
 }
 
 /// ELF 加载错误
-public enum ELFError: Error {
+public enum ELFError: Error, CustomStringConvertible {
     case notELF
     case not64Bit
     case notLittleEndian
     case notAarch64
     case truncated
     case invalidProgramHeader
-    case mmapFailed
+    case mmapFailed(errno: Int32, context: String)
+    case mprotectFailed(errno: Int32, addr: UInt64, size: Int, context: String)
+    case segmentOutOfBlock(offset: Int, size: Int, blockSize: Int)
+    case trampolineNotReady
+
+    public var description: String {
+        switch self {
+        case .notELF: return "不是 ELF 文件 (magic 不匹配)"
+        case .not64Bit: return "不是 64 位 ELF"
+        case .notLittleEndian: return "不是小端 ELF"
+        case .notAarch64: return "不是 ARM64 ELF"
+        case .truncated: return "ELF 文件截断"
+        case .invalidProgramHeader: return "ELF program header 无效"
+        case .mmapFailed(let errno, let ctx):
+            return "mmap 失败 [\(ctx)]: errno=\(errno) (\(String(cString: strerror(errno))))"
+        case .mprotectFailed(let errno, let addr, let size, let ctx):
+            return "mprotect 失败 [\(ctx)]: addr=0x\(String(addr, radix: 16)) size=\(size) errno=\(errno) (\(String(cString: strerror(errno))))"
+        case .segmentOutOfBlock(let offset, let size, let blockSize):
+            return "ELF 段越界: offset=0x\(String(offset, radix: 16)) size=\(size) blockSize=\(blockSize)"
+        case .trampolineNotReady: return "trampoline 未初始化"
+        }
+    }
 }
 
 /// ELF 解析器 (纯逻辑, 不做 I/O)

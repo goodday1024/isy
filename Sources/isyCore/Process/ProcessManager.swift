@@ -81,6 +81,7 @@ public final class ProcessManager: @unchecked Sendable {
         updateState(.loading)
         execQueue.async { [weak self] in
             guard let self = self else { return }
+            var phase = "init"
             do {
                 let emu = Emulator()
                 self.emulator = emu
@@ -89,15 +90,26 @@ public final class ProcessManager: @unchecked Sendable {
                 if let rfs = rootfs {
                     emu.process.rootfs = rfs
                 }
+                phase = "loadMain"
                 try emu.loadMain(elfData, argv: argv, envp: envp)
                 self.eventHandler?(.patchComplete(records: emu.patchTable.records.count))
+                phase = "run"
                 self.startIOPolling()
                 self.updateState(.running)
                 let code = emu.run()
                 self.stopIOPolling()
                 self.updateState(.exited(code: code))
             } catch {
-                self.updateState(.failed(String(describing: error)))
+                let elfSize = elfData.count
+                let msg: String
+                if let elfErr = error as? ELFError {
+                    msg = "[\(phase)] ELF数据=\(elfSize)字节 \(elfErr.description)"
+                } else if let memErr = error as? MemoryError {
+                    msg = "[\(phase)] ELF数据=\(elfSize)字节 \(memErr.description)"
+                } else {
+                    msg = "[\(phase)] ELF数据=\(elfSize)字节 \(String(describing: error))"
+                }
+                self.updateState(.failed(msg))
             }
         }
     }

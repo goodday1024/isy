@@ -64,12 +64,13 @@ public final class Emulator {
         let baseVA = config.loadBase
         let image = try ELFParser.parse(data: data, baseAddress: baseVA)
 
-        // 2. 加载 PT_LOAD 段
+        // 2. 加载 PT_LOAD 段 (直接复制到预分配的 trampoline 块中, 不再单独 mmap)
+        // 这样所有代码都在同一块内存中, BL 跳转距离有保证
         var execSegments: [(region: MemoryRegion, segIndex: Int, phdr: ELF64ProgramHeader)] = []
         var allSegments: [(region: MemoryRegion, segIndex: Int, phdr: ELF64ProgramHeader)] = []
         for (i, ph) in image.loadSegments.enumerated() {
             let region = try data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-                try process.addressSpace.loadELFSegment(
+                try loadSegmentIntoBlock(
                     data: buf.baseAddress!, phdr: ph, baseVA: baseVA, segIndex: i
                 )
             }
@@ -185,10 +186,38 @@ public final class Emulator {
             )
         }
 
-        // 5. flush I-cache + 切换可执行段为 R-X (W^X)
-        for seg in execSegments {
-            try process.addressSpace.makeExecutable(seg.region)
+        // 5. flush I-cache + 切换段权限 (W^X)
+        // 对可执行段: R-X, 对数据段: 保持 RW
+        #if arch(arm64)
+        let jitFlag = isy_map_jit_flag()
+        // Flush I-cache (trampoline + 所有可执行段)
+        if let blockPtr = trampBlockPtr {
+            isy_arm64_flush_icache(blockPtr, trampBlockSize)
         }
+        if jitFlag != 0 {
+            // iOS MAP_JIT: 切换为可执行模式
+            isy_jit_write_protect(1)
+            // iOS 上 MAP_JIT 内存的权限由 pthread_jit_write_protect_np 全局控制
+            // 可执行段会被正确执行, 数据段的写操作需要在 isy_jit_write_protect(0) 下进行
+            // (简化: 假设 busybox 静态二进制的数据段在执行期间不需要频繁写入)
+        } else {
+            // macOS/Linux: 对每个段单独 mprotect
+            for seg in allSegments {
+                var segProt: Int32 = PROT_READ
+                if seg.phdr.isExecutable { segProt |= PROT_EXEC }
+                if seg.phdr.isWritable { segProt |= PROT_WRITE }
+                errno = 0
+                let r = mprotect(seg.region.base, seg.region.size, segProt)
+                if r != 0 {
+                    let e = errno
+                    throw ELFError.mprotectFailed(
+                        errno: e, addr: seg.region.vaBase, size: seg.region.size,
+                        context: "loadMain seg=\(seg.segIndex) prot=0x\(String(segProt, radix: 16))"
+                    )
+                }
+            }
+        }
+        #endif
 
         // 6. 构造启动栈
         let stackRegion = try process.addressSpace.allocateAnonymous(
@@ -286,8 +315,8 @@ public final class Emulator {
         base.advanced(by: off).assumingMemoryBound(to: UInt64.self).pointee = value
     }
 
-    /// 设置 trampoline 页面: 分配一页可执行内存, 写入跳转到 __isy_syscall_trap 的代码
-    /// 然后把 loadBase 设为 trampoline 实际地址 + 0x1000, 使 ELF 代码加载在 trampoline 之后
+    /// 设置 trampoline 页面: 分配一大块内存, 前 0x1000 为 trampoline, 后面用于 ELF 代码
+    /// 这样 trampoline 和 ELF 代码在同一区域, BL 跳转距离 < 128MB
     /// SVC #0 -> BL trampoline (短距离) -> MOVZ/MOVK/BR __isy_syscall_trap (任意距离)
     private func setupTrampoline() throws {
         #if arch(arm64)
@@ -302,42 +331,106 @@ public final class Emulator {
         var flags: Int32 = MAP_PRIVATE | MAP_ANONYMOUS
         if jitFlag != 0 {
             flags |= jitFlag
-            isy_jit_write_protect(0)  // 切换为可写以写入 trampoline 代码
+            isy_jit_write_protect(0)  // 切换为可写
         }
 
-        // 不使用 MAP_FIXED, 让内核选择地址 (iOS 上固定低地址可能不可用)
-        let trampPtrOpt = mmap(nil, trampSize, PROT_READ | PROT_WRITE, flags, -1, 0)
-        guard trampPtrOpt != MAP_FAILED, let trampPtr = trampPtrOpt else {
+        // 分配一大块: trampoline (4KB) + ELF 代码空间 (预留 64MB)
+        // 这样 trampoline 和 ELF 代码在同一 mmap 区域, BL 跳转距离 < 64MB
+        let totalSize = trampSize + 64 * 1024 * 1024  // 64MB + 4KB
+        let mmapErrnoBefore = errno
+        errno = 0
+        let blockPtrOpt = mmap(nil, totalSize, PROT_READ | PROT_WRITE, flags, -1, 0)
+        let mmapErrno = errno != 0 ? errno : mmapErrnoBefore
+        guard blockPtrOpt != MAP_FAILED, let blockPtr = blockPtrOpt else {
             if jitFlag != 0 { isy_jit_write_protect(1) }
-            throw ELFError.mmapFailed
+            throw ELFError.mmapFailed(
+                errno: mmapErrno,
+                context: "setupTrampoline totalSize=\(totalSize) jitFlag=0x\(String(jitFlag, radix: 16))"
+            )
         }
 
-        // 使用 mmap 返回的实际地址 (而非 config.loadBase)
-        let actualAddr = UInt64(UInt(bitPattern: trampPtr))
+        let blockAddr = UInt64(UInt(bitPattern: blockPtr))
+        let trampPtr = blockPtr
 
         // 写入 trampoline 代码 (MOVZ/MOVK/BR __isy_syscall_trap)
         BinaryPatcher.writeTrampoline(to: trapAddr, at: trampPtr)
 
-        // Flush I-cache + 切换为可执行
+        // Flush I-cache
         isy_arm64_flush_icache(trampPtr, 16)
-        if jitFlag != 0 {
-            isy_jit_write_protect(1)  // iOS: 切换为可执行
-        } else {
-            // macOS/Linux: mprotect 切换为 R-X
-            mprotect(trampPtr, trampSize, PROT_READ | PROT_EXEC)
-        }
 
-        trampolineVA = actualAddr
+        // 注意: 不立即切换为 R-X, 因为 ELF 段也会写入这块内存
+        // makeExecutable 会在 patch 完成后统一处理
+
+        trampolineVA = blockAddr
         Emulator.sharedTrampolineVA = trampolineVA
 
-        // ELF 代码加载在 trampoline 之后 (实际地址 + 0x1000)
-        // 这样 BL 从 ELF 代码到 trampoline 的距离 <= 0x1000 + segSize, 远在 ±128MB 内
-        config.loadBase = actualAddr + UInt64(trampSize)
+        // ELF 代码加载在 trampoline 之后 (blockAddr + 0x1000)
+        // 注意: loadELFSegment 不再使用 MAP_FIXED, 所以这个 loadBase 仅用于 VA 计算
+        // 实际加载地址由 mmap 决定, 但 BL 跳转通过 patchTable 中的实际地址计算
+        config.loadBase = blockAddr + UInt64(trampSize)
+
+        // 保存大块内存的指针, 防止被释放
+        trampBlockPtr = blockPtr
+        trampBlockSize = totalSize
         #else
         // 非 arm64: 不需要 trampoline (不执行原生代码)
         trampolineVA = config.loadBase
         Emulator.sharedTrampolineVA = trampolineVA
         #endif
+    }
+
+    /// trampoline 所在的大块内存 (包含 trampoline + ELF 代码空间)
+    private var trampBlockPtr: UnsafeMutableRawPointer?
+    private var trampBlockSize: Int = 0
+
+    /// 将 ELF 段直接加载到预分配的 trampoline 块中 (不单独 mmap)
+    /// 这样所有代码都在同一块内存中, BL 跳转距离有保证
+    private func loadSegmentIntoBlock(
+        data: UnsafeRawPointer, phdr: ELF64ProgramHeader,
+        baseVA: UInt64, segIndex: Int
+    ) throws -> MemoryRegion {
+        guard let blockBase = trampBlockPtr else {
+            throw ELFError.trampolineNotReady
+        }
+        let pageSize = Int(getpagesize())
+        let pageStart = Int(phdr.vaddr) & ~(pageSize - 1)
+        let pageEnd = (Int(phdr.vaddr + phdr.memsz) + pageSize - 1) & ~(pageSize - 1)
+        let mapSize = pageEnd - pageStart
+
+        // 计算段在块中的偏移 (相对于 trampoline 之后的空间)
+        let segOffset = Int(phdr.vaddr)  // ELF 段的虚拟地址偏移
+        let blockOffset = 0x1000 + segOffset  // 跳过 trampoline 页
+
+        // 检查是否越界
+        guard blockOffset + mapSize <= trampBlockSize else {
+            throw ELFError.segmentOutOfBlock(
+                offset: blockOffset, size: mapSize, blockSize: trampBlockSize
+            )
+        }
+
+        let ptr = blockBase.advanced(by: blockOffset)
+        let va = baseVA + UInt64(pageStart)
+
+        // 拷贝 filesz 字节
+        let fileOffset = Int(phdr.offset)
+        let copyOffset = Int(phdr.vaddr) - pageStart
+        memcpy(ptr.advanced(by: copyOffset), data.advanced(by: fileOffset), Int(phdr.filesz))
+        // BSS 清零
+        let bssStart = copyOffset + Int(phdr.filesz)
+        let bssEnd = copyOffset + Int(phdr.memsz)
+        if bssStart < bssEnd {
+            memset(ptr.advanced(by: bssStart), 0, bssEnd - bssStart)
+        }
+
+        let region = MemoryRegion(
+            base: ptr, size: mapSize,
+            prot: ProtFlags(rawValue: Int32(phdr.flags & 7)),
+            vaBase: va,
+            backing: .elfSegment(index: segIndex)
+        )
+        process.addressSpace.regions.append(region)
+        process.addressSpace.regions.sort { $0.vaBase < $1.vaBase }
+        return region
     }
 
     /// 运行 (只在 arm64 平台可用)

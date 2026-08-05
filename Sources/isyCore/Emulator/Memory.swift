@@ -46,11 +46,24 @@ public struct MemoryRegion {
 }
 
 /// 内存映射错误
-public enum MemoryError: Error {
+public enum MemoryError: Error, CustomStringConvertible {
     case mmapFailed(errno: Int32)
     case mprotectFailed(errno: Int32, addr: UInt64, size: Int)
     case regionConflict(va: UInt64, size: Int)
     case outOfAddressSpace
+
+    public var description: String {
+        switch self {
+        case .mmapFailed(let errno):
+            return "mmap 失败: errno=\(errno) (\(String(cString: strerror(errno))))"
+        case .mprotectFailed(let errno, let addr, let size):
+            return "mprotect 失败: addr=0x\(String(addr, radix: 16)) size=\(size) errno=\(errno) (\(String(cString: strerror(errno))))"
+        case .regionConflict(let va, let size):
+            return "区域冲突: va=0x\(String(va, radix: 16)) size=\(size)"
+        case .outOfAddressSpace:
+            return "地址空间耗尽"
+        }
+    }
 }
 
 /// Linux 进程地址空间
@@ -71,7 +84,7 @@ public final class LinuxAddressSpace {
     /// - Parameters:
     ///   - size: 字节数 (会向上对齐到页大小)
     ///   - prot: 保护标志
-    ///   - vaHint: 期望的虚拟地址 (MAP_FIXED, 0 表示由内核选择)
+    ///   - vaHint: 期望的虚拟地址 (iOS 上忽略, 由内核选择)
     ///   - backing: 区域类型
     /// - Returns: 实际分配的区域
     public func allocateAnonymous(
@@ -87,19 +100,20 @@ public final class LinuxAddressSpace {
         if prot.contains(.write) { posixProt |= PROT_WRITE }
         if prot.contains(.exec)  { posixProt |= PROT_EXEC }
 
-        var flags: Int32 = MAP_PRIVATE | MAP_ANONYMOUS
-        if vaHint != 0 { flags |= MAP_FIXED }
+        // iOS 上不使用 MAP_FIXED, 让内核选择地址
+        let flags: Int32 = MAP_PRIVATE | MAP_ANONYMOUS
 
-        let hintPtr = UnsafeMutableRawPointer(bitPattern: UInt(vaHint))
-        let mmapResult = mmap(hintPtr, alignedSize, posixProt, flags, -1, 0)
+        let mmapResult = mmap(nil, alignedSize, posixProt, flags, -1, 0)
         guard let ptr = mmapResult,
               ptr != UnsafeMutableRawPointer(bitPattern: UInt.max) else {
             throw MemoryError.mmapFailed(errno: errno)
         }
 
+        // VA: 用内核返回的实际地址 (而非 vaHint)
+        let actualVA = UInt64(UInt(bitPattern: ptr))
         let region = MemoryRegion(
             base: ptr, size: alignedSize, prot: prot,
-            vaBase: vaHint != 0 ? vaHint : UInt64(UInt(bitPattern: ptr)),
+            vaBase: actualVA,
             backing: backing
         )
         regions.append(region)
@@ -111,7 +125,7 @@ public final class LinuxAddressSpace {
     /// - Parameters:
     ///   - segment: ELF 段数据 (filesz 字节)
     ///   - phdr: ELF program header
-    ///   - baseVA: 加载基址 (PIE 时由 caller 决定)
+    ///   - baseVA: 加载基址 (PIE 时由 caller 决定, 仅用于计算 VA, 不用于 mmap hint)
     ///   - segIndex: 段索引
     /// - Returns: 加载后的区域
     public func loadELFSegment(
@@ -129,7 +143,9 @@ public final class LinuxAddressSpace {
         var posixProt: Int32 = PROT_READ | PROT_WRITE
         // 不在此处加 PROT_EXEC, patch 完成后由 makeExecutable 开启
 
-        var flags: Int32 = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED
+        // 不使用 MAP_FIXED: iOS 上 MAP_FIXED 会 unmap 已有页面, 几乎总是失败
+        // 让内核选择实际地址, 我们通过 MemoryRegion.base 跟踪映射关系
+        var flags: Int32 = MAP_PRIVATE | MAP_ANONYMOUS
         if isExec {
             // iOS 可执行段: 添加 MAP_JIT flag
             flags |= Int32(isy_map_jit_flag())
@@ -137,9 +153,9 @@ public final class LinuxAddressSpace {
             isy_jit_write_protect(0)
         }
 
+        // VA 仅用于内部地址计算, mmap 不用 MAP_FIXED
         let va = baseVA + UInt64(pageStart)
-        let hintPtr = UnsafeMutableRawPointer(bitPattern: UInt(va))
-        let mmapResult = mmap(hintPtr, mapSize, posixProt, flags, -1, 0)
+        let mmapResult = mmap(nil, mapSize, posixProt, flags, -1, 0)
         guard let ptr = mmapResult,
               ptr != UnsafeMutableRawPointer(bitPattern: UInt.max) else {
             if isExec { isy_jit_write_protect(1) }  // 恢复
@@ -159,7 +175,6 @@ public final class LinuxAddressSpace {
 
         // iOS: 写入完成, 保持可写状态 (binary patching 还需要写入)
         // makeExecutable 会在 patch 完成后切换为可执行
-        // 注意: isy_jit_write_protect(0) 已在上方调用, 保持可写
 
         let region = MemoryRegion(
             base: ptr, size: mapSize,
@@ -183,9 +198,14 @@ public final class LinuxAddressSpace {
             // macOS/Linux: 用 mprotect 切换为 R-X
             var posixProt: Int32 = PROT_READ
             if region.prot.contains(.exec) { posixProt |= PROT_EXEC }
+            errno = 0
             let r = mprotect(region.base, region.size, posixProt)
             if r != 0 {
-                throw MemoryError.mprotectFailed(errno: errno, addr: region.vaBase, size: region.size)
+                let e = errno
+                throw ELFError.mprotectFailed(
+                    errno: e, addr: region.vaBase, size: region.size,
+                    context: "makeExecutable base=\(region.base) prot=0x\(String(posixProt, radix: 16))"
+                )
             }
         }
         // flush I-cache (自修改代码必须!)
@@ -194,9 +214,14 @@ public final class LinuxAddressSpace {
 
     /// 把一个区域改为只读 (RELRO 段用)
     public func makeReadOnly(_ region: MemoryRegion) throws {
+        errno = 0
         let r = mprotect(region.base, region.size, PROT_READ)
         if r != 0 {
-            throw MemoryError.mprotectFailed(errno: errno, addr: region.vaBase, size: region.size)
+            let e = errno
+            throw ELFError.mprotectFailed(
+                errno: e, addr: region.vaBase, size: region.size,
+                context: "makeReadOnly"
+            )
         }
     }
 

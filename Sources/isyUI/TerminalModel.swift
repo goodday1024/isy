@@ -115,7 +115,10 @@ public final class TerminalModel: ObservableObject {
             case .failed(let msg):
                 processState = "failed"
                 isRunning = false
-                writeToBuffer("\u{1B}[31m启动失败: \(msg)\u{1B}[0m\n")
+                writeToBuffer("\u{1B}[31m┌─ 启动失败 ─────────────────────────\u{1B}[0m\n")
+                writeToBuffer("\u{1B}[31m│ \u{1B}[33m\(msg)\u{1B}[0m\n")
+                writeToBuffer("\u{1B}[31m└─────────────────────────────────────\u{1B}[0m\n")
+                writeToBuffer("\u{1B}[2m提示: 请截图此错误信息反馈\u{1B}[0m\n")
             }
         case .patchComplete:
             break
