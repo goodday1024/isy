@@ -65,16 +65,30 @@ jobs:
       - name: Download ARM64 busybox
         run: |
           mkdir -p Sources/isyApp/Resources
-          echo "下载 ARM64 静态 busybox..."
+          echo "下载 ARM64 静态 busybox (Alpine busybox-static)..."
+          # 从 Alpine 官方 CDN 下载 busybox-static APK (aarch64, static-pie linked)
           curl -fL --retry 3 \
-            https://busybox.net/downloads/binaries/1.36.1-defconfig-multiarch-musl/busybox-aarch64 \
-            -o Sources/isyApp/Resources/busybox
+            https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/aarch64/busybox-static-1.37.0-r31.apk \
+            -o /tmp/busybox-static.apk
+          # APK 是 gzip tar, 从中提取 bin/busybox.static
+          mkdir -p /tmp/bb-extract
+          tar -xzf /tmp/busybox-static.apk -C /tmp/bb-extract 2>/dev/null || true
+          cp /tmp/bb-extract/bin/busybox.static Sources/isyApp/Resources/busybox
           chmod +x Sources/isyApp/Resources/busybox
           echo "busybox 大小: $(stat -f%z Sources/isyApp/Resources/busybox) bytes"
-          # 验证 ELF magic + aarch64
+          # 验证: ELF magic + aarch64 + static linked
           file Sources/isyApp/Resources/busybox || true
-          # ELF header 检查: 0x7F 'E' 'L' 'F' + machine=0xB7 (183=aarch64)
-          head -c 20 Sources/isyApp/Resources/busybox | xxd | head -2
+          # ELF header 校验: 0x7F 'E' 'L' 'F' + machine=0xB7 (183=aarch64)
+          head -c 20 Sources/isyApp/Resources/busybox | od -A x -t x1z | head -2
+          # 严格校验 ELF magic 和 aarch64 机器类型
+          if [ "$(head -c 4 Sources/isyApp/Resources/busybox)" != $'\x7fELF' ]; then
+            echo "错误: 不是有效的 ELF 文件"; exit 1
+          fi
+          machine=$(od -A n -t x1 -j 18 -N 1 Sources/isyApp/Resources/busybox | tr -d ' ')
+          if [ "$machine" != "b7" ]; then
+            echo "错误: 不是 aarch64 (machine=0x$b7 实际=0x$machine)"; exit 1
+          fi
+          echo "✓ ARM64 静态 busybox 校验通过"
 
       - name: Install xcodegen
         run: brew install xcodegen
