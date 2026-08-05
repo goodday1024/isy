@@ -103,7 +103,7 @@ public final class TerminalModel: ObservableObject {
         case .stdout(let text):
             appendOutput(text)
         case .stderr(let text):
-            writeToBuffer("\u{1B}[31m\(text)\u{1B}[0m")
+            appendOutput(text)
         case .stateChanged(let state):
             switch state {
             case .idle: processState = "idle"
@@ -112,18 +112,17 @@ public final class TerminalModel: ObservableObject {
             case .exited(let code):
                 processState = "exited(\(code))"
                 isRunning = false
-                writeToBuffer("\u{1B}[2m[进程已退出, 退出码: \(code)]\u{1B}[0m\n")
             case .failed(let msg):
                 processState = "failed"
                 isRunning = false
-                writeToBuffer("\u{1B}[31m[启动失败: \(msg)]\u{1B}[0m\n")
+                writeToBuffer("\u{1B}[31m启动失败: \(msg)\u{1B}[0m\n")
             }
-        case .patchComplete(let records):
-            writeToBuffer("\u{1B}[32m[Binary patching 完成: \(records) 条 SVC->BL 替换]\u{1B}[0m\n")
-        case .syscallTrace(let name, let result):
-            writeToBuffer("\u{1B}[2m[syscall] \(name) = \(result)\u{1B}[0m\n")
-        case .signalDelivered(let sig):
-            writeToBuffer("\u{1B}[2m[信号 \(sig) 已投递]\u{1B}[0m\n")
+        case .patchComplete:
+            break
+        case .syscallTrace:
+            break
+        case .signalDelivered:
+            break
         }
     }
 

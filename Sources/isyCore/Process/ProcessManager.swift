@@ -89,9 +89,7 @@ public final class ProcessManager: @unchecked Sendable {
                 if let rfs = rootfs {
                     emu.process.rootfs = rfs
                 }
-                self.emitLog("[4/6] ELF 解析 + 段加载 + binary patching...")
                 try emu.loadMain(elfData, argv: argv, envp: envp)
-                self.emitLog("[5/6] patch 完成: \(emu.patchTable.records.count) 条 SVC->BL, 进入原生执行")
                 self.eventHandler?(.patchComplete(records: emu.patchTable.records.count))
                 self.startIOPolling()
                 self.updateState(.running)
@@ -99,17 +97,8 @@ public final class ProcessManager: @unchecked Sendable {
                 self.stopIOPolling()
                 self.updateState(.exited(code: code))
             } catch {
-                self.emitLog("[失败] \(String(describing: error))")
                 self.updateState(.failed(String(describing: error)))
             }
-        }
-    }
-
-    /// 输出日志到终端 (通过 stdout 事件)
-    private func emitLog(_ msg: String) {
-        let handler = eventHandler
-        DispatchQueue.main.async {
-            handler?(.stdout("\u{1B}[2m\(msg)\u{1B}[0m\n"))
         }
     }
 

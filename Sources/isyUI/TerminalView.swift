@@ -47,17 +47,15 @@ public struct TerminalView: View {
         return max(20, Int(usable / charWidth))
     }
 
-    /// 只渲染有内容的行 + 光标行, 跳过尾部空行
+    /// 只渲染有内容的行, 跳过尾部空行
     private var visibleRows: [([TerminalCell], Int)] {
         let grid = model.buffer.grid
-        // 找到最后一个有内容的行
         var lastNonEmpty = -1
         for (i, row) in grid.enumerated() {
             if !row.allSatisfy({ $0.char == " " }) {
                 lastNonEmpty = i
             }
         }
-        // 渲染 0...lastNonEmpty 行 (至少渲染 0 行, 即输入行紧跟在 banner 后)
         let endIdx = max(lastNonEmpty + 1, 0)
         return (0..<endIdx).map { i in (grid[i], i) }
     }
@@ -65,7 +63,6 @@ public struct TerminalView: View {
     public var body: some View {
         GeometryReader { geometry in
             VStack(spacing: 0) {
-                // 工具栏
                 if showToolbar {
                     toolbarView
                         .transition(.move(edge: .top).combined(with: .opacity))
@@ -74,13 +71,12 @@ public struct TerminalView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
-                            // 只渲染有内容的行
                             ForEach(visibleRows, id: \.1) { row, rowIdx in
                                 rowView(row: row)
                                     .id("row-\(rowIdx)")
                             }
-                            // 当前输入行
-                            HStack(spacing: 0) {
+                            // 输入行: prompt + TextField
+                            HStack(alignment: .firstTextBaseline, spacing: 0) {
                                 Text(model.prompt)
                                     .font(terminalFont)
                                     .foregroundColor(.green)
@@ -123,12 +119,11 @@ public struct TerminalView: View {
                             }
                             .id("input-line")
                             .padding(.horizontal, 8)
-                            .frame(minHeight: lineHeight)
+                            .frame(minHeight: lineHeight, alignment: .leading)
                         }
                         .padding(.vertical, 4)
                     }
                     .background(Color.black)
-                    // 点击空白区域时重新聚焦 TextField (保持键盘)
                     .contentShape(Rectangle())
                     .onTapGesture {
                         inputFocused = true
@@ -140,7 +135,6 @@ public struct TerminalView: View {
                     }
                     .onAppear {
                         availableWidth = geometry.size.width
-                        // 延迟聚焦, 等布局完成
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                             inputFocused = true
                             proxy.scrollTo("input-line", anchor: .bottom)
@@ -149,21 +143,18 @@ public struct TerminalView: View {
                     .onChange(of: geometry.size.width) { _, newWidth in
                         availableWidth = newWidth
                     }
-                    // 双击显示工具栏 (用 simultaneousGesture 避免干扰 TextField)
                     .simultaneousGesture(
                         TapGesture(count: 2)
                             .onEnded {
                                 withAnimation { showToolbar.toggle() }
                             }
                     )
-                    // 长按复制
                     .simultaneousGesture(
                         LongPressGesture(minimumDuration: 0.8)
                             .onEnded { _ in
                                 copyLastLine()
                             }
                     )
-                    // 右键菜单 (iPad 外接鼠标)
                     .contextMenu {
                         Button {
                             copyLastLine()
@@ -262,7 +253,7 @@ public struct TerminalView: View {
     @ViewBuilder
     private func rowView(row: [TerminalCell]) -> some View {
         if row.allSatisfy({ $0.char == " " }) {
-            // 空行: 占位
+            // 空行: 占位 (与有内容行同样的 padding)
             Color.clear
                 .frame(height: lineHeight)
                 .padding(.horizontal, 8)

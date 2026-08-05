@@ -15,7 +15,7 @@ settings:
     GCC_TREAT_WARNINGS_AS_ERRORS: NO
     CLANG_ENABLE_MODULES: YES
     OTHER_LDFLAGS: "-ObjC"
-    ENABLE_JIT: NO
+    ENABLE_JIT: YES
 
 targets:
   isyApp:
@@ -39,9 +39,10 @@ targets:
         INFOPLIST_FILE: Sources/isyApp/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
-        CODE_SIGN_IDENTITY: ""
-        CODE_SIGNING_REQUIRED: NO
-        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGN_ENTITLEMENTS: Sources/isyApp/isy.entitlements
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: YES
+        CODE_SIGNING_ALLOWED: YES
         DEVELOPMENT_TEAM: ""
 
 packages:
