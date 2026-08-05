@@ -18,6 +18,7 @@ public struct TerminalView: View {
     @FocusState private var inputFocused: Bool
     @State private var showToolbar: Bool = false
     @State private var showCopyConfirmation: Bool = false
+    @State private var availableWidth: CGFloat = 0
 
     public var fontSize: CGFloat
 
@@ -32,6 +33,18 @@ public struct TerminalView: View {
 
     private var lineHeight: CGFloat {
         fontSize * 1.35
+    }
+
+    /// 等宽字体单字符宽度 (近似值, SF Mono 约为字号的 0.6 倍)
+    private var charWidth: CGFloat {
+        fontSize * 0.6
+    }
+
+    /// 根据屏幕实际宽度和字号计算列数
+    private var dynamicCols: Int {
+        let padding: CGFloat = 16  // 左右各 8pt
+        let usable = max(availableWidth - padding, 100)
+        return max(20, Int(usable / charWidth))
     }
 
     /// 只渲染有内容的行 + 光标行, 跳过尾部空行
@@ -50,141 +63,158 @@ public struct TerminalView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            // 工具栏
-            if showToolbar {
-                toolbarView
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                // 工具栏
+                if showToolbar {
+                    toolbarView
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        // 只渲染有内容的行
-                        ForEach(visibleRows, id: \.1) { row, rowIdx in
-                            rowView(row: row)
-                                .id("row-\(rowIdx)")
-                        }
-                        // 当前输入行
-                        HStack(spacing: 0) {
-                            Text(model.prompt)
-                                .font(terminalFont)
-                                .foregroundColor(.green)
-                            TextField("", text: $model.currentInput)
-                                .focused($inputFocused)
-                                .textFieldStyle(.plain)
-                                .font(terminalFont)
-                                .foregroundColor(.white)
-                                .autocorrectionDisabled()
-                                .textInputAutocapitalization(.never)
-                                .onSubmit {
-                                    model.submitInput()
-                                }
-                                .onKeyPress(.upArrow) {
-                                    model.navigateHistory(.up)
-                                    return .handled
-                                }
-                                .onKeyPress(.downArrow) {
-                                    model.navigateHistory(.down)
-                                    return .handled
-                                }
-                                .onKeyPress(.escape) {
-                                    model.currentInput = ""
-                                    return .handled
-                                }
-                                .onKeyPress(characters: CharacterSet(charactersIn: "cC")) { press in
-                                    if press.modifiers.contains(.control) {
-                                        model.sendInterrupt()
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            // 只渲染有内容的行
+                            ForEach(visibleRows, id: \.1) { row, rowIdx in
+                                rowView(row: row)
+                                    .id("row-\(rowIdx)")
+                            }
+                            // 当前输入行
+                            HStack(spacing: 0) {
+                                Text(model.prompt)
+                                    .font(terminalFont)
+                                    .foregroundColor(.green)
+                                TextField("", text: $model.currentInput)
+                                    .focused($inputFocused)
+                                    .textFieldStyle(.plain)
+                                    .font(terminalFont)
+                                    .foregroundColor(.white)
+                                    .autocorrectionDisabled()
+                                    .textInputAutocapitalization(.never)
+                                    .onSubmit {
+                                        model.submitInput()
+                                    }
+                                    .onKeyPress(.upArrow) {
+                                        model.navigateHistory(.up)
                                         return .handled
                                     }
-                                    return .ignored
-                                }
-                                .onKeyPress(characters: CharacterSet(charactersIn: "dD")) { press in
-                                    if press.modifiers.contains(.control) {
-                                        model.sendEOF()
+                                    .onKeyPress(.downArrow) {
+                                        model.navigateHistory(.down)
                                         return .handled
                                     }
-                                    return .ignored
-                                }
+                                    .onKeyPress(.escape) {
+                                        model.currentInput = ""
+                                        return .handled
+                                    }
+                                    .onKeyPress(characters: CharacterSet(charactersIn: "cC")) { press in
+                                        if press.modifiers.contains(.control) {
+                                            model.sendInterrupt()
+                                            return .handled
+                                        }
+                                        return .ignored
+                                    }
+                                    .onKeyPress(characters: CharacterSet(charactersIn: "dD")) { press in
+                                        if press.modifiers.contains(.control) {
+                                            model.sendEOF()
+                                            return .handled
+                                        }
+                                        return .ignored
+                                    }
+                            }
+                            .id("input-line")
+                            .padding(.horizontal, 8)
+                            .frame(minHeight: lineHeight)
                         }
-                        .id("input-line")
-                        .padding(.horizontal, 8)
-                        .frame(minHeight: lineHeight)
+                        .padding(.vertical, 4)
                     }
-                    .padding(.vertical, 4)
-                }
-                .background(Color.black)
-                // 点击空白区域时重新聚焦 TextField (保持键盘)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    inputFocused = true
-                }
-                .onChange(of: model.linesVersion) { _, _ in
-                    withAnimation(.easeOut(duration: 0.05)) {
-                        proxy.scrollTo("input-line", anchor: .bottom)
-                    }
-                }
-                .onAppear {
-                    // 延迟聚焦, 等布局完成
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    .background(Color.black)
+                    // 点击空白区域时重新聚焦 TextField (保持键盘)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
                         inputFocused = true
-                        proxy.scrollTo("input-line", anchor: .bottom)
                     }
-                }
-                // 双击显示工具栏 (用 simultaneousGesture 避免干扰 TextField)
-                .simultaneousGesture(
-                    TapGesture(count: 2)
-                        .onEnded {
-                            withAnimation { showToolbar.toggle() }
+                    .onChange(of: model.linesVersion) { _, _ in
+                        withAnimation(.easeOut(duration: 0.05)) {
+                            proxy.scrollTo("input-line", anchor: .bottom)
                         }
-                )
-                // 长按复制
-                .simultaneousGesture(
-                    LongPressGesture(minimumDuration: 0.8)
-                        .onEnded { _ in
+                    }
+                    .onAppear {
+                        availableWidth = geometry.size.width
+                        // 延迟聚焦, 等布局完成
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            inputFocused = true
+                            proxy.scrollTo("input-line", anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: geometry.size.width) { _, newWidth in
+                        availableWidth = newWidth
+                    }
+                    // 双击显示工具栏 (用 simultaneousGesture 避免干扰 TextField)
+                    .simultaneousGesture(
+                        TapGesture(count: 2)
+                            .onEnded {
+                                withAnimation { showToolbar.toggle() }
+                            }
+                    )
+                    // 长按复制
+                    .simultaneousGesture(
+                        LongPressGesture(minimumDuration: 0.8)
+                            .onEnded { _ in
+                                copyLastLine()
+                            }
+                    )
+                    // 右键菜单 (iPad 外接鼠标)
+                    .contextMenu {
+                        Button {
                             copyLastLine()
+                        } label: {
+                            Label("复制", systemImage: "doc.on.doc")
                         }
-                )
-                // 右键菜单 (iPad 外接鼠标)
-                .contextMenu {
-                    Button {
-                        copyLastLine()
-                    } label: {
-                        Label("复制", systemImage: "doc.on.doc")
-                    }
-                    Button {
-                        pasteFromClipboard()
-                    } label: {
-                        Label("粘贴", systemImage: "doc.on.clipboard")
-                    }
-                    Divider()
-                    Button {
-                        model.clearScreen()
-                    } label: {
-                        Label("清屏", systemImage: "trash")
-                    }
-                    Button {
-                        model.sendInterrupt()
-                    } label: {
-                        Label("Ctrl+C", systemImage: "stop.circle")
+                        Button {
+                            pasteFromClipboard()
+                        } label: {
+                            Label("粘贴", systemImage: "doc.on.clipboard")
+                        }
+                        Divider()
+                        Button {
+                            model.clearScreen()
+                        } label: {
+                            Label("清屏", systemImage: "trash")
+                        }
+                        Button {
+                            model.sendInterrupt()
+                        } label: {
+                            Label("Ctrl+C", systemImage: "stop.circle")
+                        }
                     }
                 }
             }
-        }
-        .background(Color.black)
-        .overlay(alignment: .bottom) {
-            if showCopyConfirmation {
-                Text("已复制")
-                    .font(.caption)
-                    .padding(6)
-                    .background(.ultraThinMaterial)
-                    .cornerRadius(6)
-                    .transition(.opacity)
-                    .onAppear {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                            withAnimation { showCopyConfirmation = false }
+            .background(Color.black)
+            .overlay(alignment: .bottom) {
+                if showCopyConfirmation {
+                    Text("已复制")
+                        .font(.caption)
+                        .padding(6)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(6)
+                        .transition(.opacity)
+                        .onAppear {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                withAnimation { showCopyConfirmation = false }
+                            }
                         }
-                    }
+                }
+            }
+            .onAppear {
+                availableWidth = geometry.size.width
+                model.buffer.resize(cols: dynamicCols, rows: model.buffer.rows)
+            }
+            .onChange(of: geometry.size.width) { _, newWidth in
+                availableWidth = newWidth
+                model.buffer.resize(cols: dynamicCols, rows: model.buffer.rows)
+            }
+            .onChange(of: fontSize) { _, _ in
+                model.buffer.resize(cols: dynamicCols, rows: model.buffer.rows)
             }
         }
     }
@@ -239,7 +269,9 @@ public struct TerminalView: View {
         } else {
             Text(buildAttributedLine(from: row))
                 .font(terminalFont)
-                .frame(height: lineHeight)
+                .lineLimit(1)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 8)
                 .textSelection(.enabled)
         }
