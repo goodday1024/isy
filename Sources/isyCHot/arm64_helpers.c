@@ -14,21 +14,22 @@
 #include <stdio.h>  // snprintf (isy_jit_status)
 
 // ---------- iOS JIT 内存支持 ----------
-// iOS 上执行运行时修改的代码必须使用 MAP_JIT + pthread_jit_write_protect_np.
+// iOS 上执行运行时修改的代码必须使用 MAP_JIT 内存.
 //
-// 关键问题: pthread_jit_write_protect_np 在 iOS SDK 头文件中被标记为
-// __API_UNAVAILABLE(ios), 但符号在 libsystem_pthread.dylib 中确实存在.
+// 关键事实:
+//   1. pthread_jit_write_protect_np 在 iOS SDK 的 libsystem_pthread.tbd 中
+//      未导出, 导致 weak_import + asm label 仍然链接失败 ("symbol not found").
+//      (它只在 macOS SDK 中可用, iOS 上是隐藏的私有符号)
+//   2. dlsym(RTLD_DEFAULT, ...) 在 iOS 上也搜不到该私有符号.
+//   3. iOS 17+ 上, 对于带 com.apple.security.cs.allow-jit entitlement 的应用,
+//      MAP_JIT 内存可以自动 W<->X 切换, 无需显式调用 write-protect 函数.
+//      (系统根据访问模式自动处理)
 //
-// 解决方案:
-//   1. 用 asm label ("_pthread_jit_write_protect_np") 绕过 SDK 头件的
-//      unavailable 标记 (我们不 include <pthread.h>, 直接声明)
-//   2. 用 weak_import 保证符号不存在时不会链接失败 (回退为 NULL)
-//   3. dlsym 作为 macOS 的 fallback (iOS 上 dlsym 搜不到私有符号)
-//
-// 为什么 dlsym 在 iOS 上失败:
-//   iOS 的 dlsym(RTLD_DEFAULT, ...) 只搜索 public exported symbols.
-//   pthread_jit_write_protect_np 是私有符号, 不在 public export trie 中.
-//   但 weak_import 在 link time 直接解析符号 (不走 dlsym), 所以能找到.
+// 策略:
+//   - iOS: 直接使用 MAP_JIT, 不调用 pthread_jit_write_protect_np
+//          (依赖系统自动 W^X 切换)
+//   - macOS: 用 dlsym 查找 pthread_jit_write_protect_np (hardened runtime 需要)
+//   - Linux: 空操作
 #if defined(__APPLE__) && defined(__MACH__)
 #include <dlfcn.h>
 #include <TargetConditionals.h>
@@ -36,12 +37,6 @@
 #ifndef MAP_JIT
 #define MAP_JIT 0x8000
 #endif
-
-// 用 asm label 声明符号, 绕过 SDK 头文件的 __API_UNAVAILABLE(ios) 标记.
-// weak_import: 如果符号在 link library 中不存在, 运行时为 NULL (不会链接失败).
-extern void isy_pthread_jit_write_protect_np(int enable)
-    __attribute__((weak_import))
-    __asm("_pthread_jit_write_protect_np");
 
 typedef void (*isy_jit_write_protect_fn)(int);
 
@@ -53,24 +48,23 @@ static isy_jit_write_protect_fn isy_lookup_jit_write_protect(void) {
     static isy_jit_write_protect_fn func = NULL;
     static bool initialized = false;
     if (!initialized) {
-        // Method 1: weak_import 符号 (link-time 解析, iOS 上能找到私有符号)
-        if (isy_pthread_jit_write_protect_np != NULL) {
-            func = isy_pthread_jit_write_protect_np;
+        // iOS 上不查找 (符号未导出, 找不到也用不了)
+        // 直接依赖 MAP_JIT 内存的自动 W^X 切换
+#if !TARGET_OS_IPHONE
+        // macOS: 用 dlsym 查找 (hardened runtime 需要)
+        func = (isy_jit_write_protect_fn)dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
+        if (func) {
             isy_jit_wp_available = 1;
-            isy_jit_wp_source = "weak_import";
-        }
-        // Method 2: dlsym (macOS fallback, 或 iOS 上作为最后手段)
-        if (!func) {
-            func = (isy_jit_write_protect_fn)dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
-            if (func) {
-                isy_jit_wp_available = 1;
-                isy_jit_wp_source = "dlsym";
-            }
-        }
-        if (!func) {
+            isy_jit_wp_source = "dlsym";
+        } else {
             isy_jit_wp_available = -1;
             isy_jit_wp_source = "not_found";
         }
+#else
+        // iOS: write-protect 函数不可访问, 但 MAP_JIT 内存仍可用
+        isy_jit_wp_available = -1;
+        isy_jit_wp_source = "auto (iOS MAP_JIT)";
+#endif
         initialized = true;
     }
     return func;
@@ -78,29 +72,23 @@ static isy_jit_write_protect_fn isy_lookup_jit_write_protect(void) {
 
 void isy_jit_write_protect(int enabled) {
     // enabled=1 -> 可执行 (R-X), enabled=0 -> 可写 (R-W)
+    // iOS 上: 空操作 (MAP_JIT 内存自动切换)
+    // macOS 上: 调用 dlsym 找到的函数
     isy_jit_write_protect_fn func = isy_lookup_jit_write_protect();
     if (func) {
         func(enabled);
     }
-    // 如果函数不可用 (无 entitlement), 静默忽略
 }
 
 int isy_map_jit_flag(void) {
 #if TARGET_OS_IPHONE
     // iOS: 必须使用 MAP_JIT 才能执行运行时修改的代码.
-    // 即使 pthread_jit_write_protect_np 不可用, MAP_JIT 内存也必须使用,
-    // 否则 mprotect(PROT_EXEC) 会返回 EINVAL (这正是之前的启动失败原因).
-    // 如果 write-protect 函数不可用, MAP_JIT 内存将无法执行 (会在执行时 crash),
-    // 但至少错误信息会更明确.
-    isy_jit_write_protect_fn func = isy_lookup_jit_write_protect();
-    if (func != NULL) {
-        return MAP_JIT;
-    }
-    // write-protect 函数不可用, MAP_JIT 也无法使用
-    // 这种情况下 isy 无法在 iOS 上运行 Linux 代码
-    return 0;
+    // 即使 pthread_jit_write_protect_np 不可用, MAP_JIT 内存仍可用:
+    // iOS 17+ 上带 com.apple.security.cs.allow-jit entitlement 时,
+    // MAP_JIT 内存的 W/X 切换由系统自动处理.
+    return MAP_JIT;
 #else
-    // macOS: 不需要 MAP_JIT (mprotect RX 即可, 但 hardened runtime 需要 entitlement)
+    // macOS: 不需要 MAP_JIT (mprotect RX 即可)
     return 0;
 #endif
 }
