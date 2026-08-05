@@ -109,6 +109,9 @@ void     isy_arm64_dc_cvau(void *addr, size_t len);  // D-cache clean to PoU
 void     isy_jit_write_protect(int enabled);  // 0=可写, 1=可执行
 // 返回 MAP_JIT flag 值 (iOS=0x8000, 其他平台=0)
 int      isy_map_jit_flag(void);
+// 返回 JIT 状态描述字符串 (诊断用)
+// 格式: "platform=iOS map_jit=1 wp_fn=linked" 等
+const char *isy_jit_status(void);
 
 // ---------- 统计 ----------
 typedef struct {

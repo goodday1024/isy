@@ -116,7 +116,10 @@ public final class TerminalModel: ObservableObject {
                 processState = "failed"
                 isRunning = false
                 writeToBuffer("\u{1B}[31m┌─ 启动失败 ─────────────────────────\u{1B}[0m\n")
-                writeToBuffer("\u{1B}[31m│ \u{1B}[33m\(msg)\u{1B}[0m\n")
+                // 多行错误信息, 每行加 │ 前缀
+                for line in msg.split(separator: "\n", omittingEmptySubsequences: false) {
+                    writeToBuffer("\u{1B}[31m│ \u{1B}[33m\(line)\u{1B}[0m\n")
+                }
                 writeToBuffer("\u{1B}[31m└─────────────────────────────────────\u{1B}[0m\n")
                 writeToBuffer("\u{1B}[2m提示: 请截图此错误信息反馈\u{1B}[0m\n")
             }

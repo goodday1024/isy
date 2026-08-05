@@ -20,6 +20,7 @@ import Glibc
 #elseif canImport(Darwin)
 import Darwin
 #endif
+import isyCHot
 
 // MARK: - 进程状态 & 事件
 
@@ -101,13 +102,14 @@ public final class ProcessManager: @unchecked Sendable {
                 self.updateState(.exited(code: code))
             } catch {
                 let elfSize = elfData.count
+                let jitStatus = String(cString: isy_jit_status())
                 let msg: String
                 if let elfErr = error as? ELFError {
-                    msg = "[\(phase)] ELF数据=\(elfSize)字节 \(elfErr.description)"
+                    msg = "[\(phase)] ELF数据=\(elfSize)字节 \(elfErr.description)\n JIT状态: \(jitStatus)"
                 } else if let memErr = error as? MemoryError {
-                    msg = "[\(phase)] ELF数据=\(elfSize)字节 \(memErr.description)"
+                    msg = "[\(phase)] ELF数据=\(elfSize)字节 \(memErr.description)\n JIT状态: \(jitStatus)"
                 } else {
-                    msg = "[\(phase)] ELF数据=\(elfSize)字节 \(String(describing: error))"
+                    msg = "[\(phase)] ELF数据=\(elfSize)字节 \(String(describing: error))\n JIT状态: \(jitStatus)"
                 }
                 self.updateState(.failed(msg))
             }
