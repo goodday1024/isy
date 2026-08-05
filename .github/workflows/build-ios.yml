@@ -103,28 +103,35 @@ jobs:
           echo "Resolved SDK: $SDK"
           echo "sdk=$SDK" >> $GITHUB_OUTPUT
 
-      - name: Build archive (unsigned)
+      - name: Build archive (ad-hoc signed with entitlements)
         run: |
           mkdir -p build
-          # 用 -sdk 替代 -destination, 避免 "iOS X.X is not installed" 平台缺失问题
+          # 用 ad-hoc 签名 (-) + entitlements, 让 MAP_JIT 在 iOS 上可用
+          # 关键: 必须保留 com.apple.security.cs.allow-jit 和 get-task-allow
+          # 用户通过 AltStore/Esign 等工具重签时会保留这些 entitlements
           xcodebuild archive \
             -project isy.xcodeproj \
             -scheme isyApp \
             -configuration Release \
             -sdk ${{ steps.sdk.outputs.sdk }} \
             -archivePath build/isy.xcarchive \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_ENTITLEMENTS=Sources/isyApp/isy.entitlements \
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             ARCHS=arm64
 
       - name: Export unsigned ipa
         run: |
           mkdir -p build/export
+          # 验证 entitlements 已嵌入二进制
+          echo "=== 验证 entitlements ==="
+          codesign -d --entitlements - build/isy.xcarchive/Products/Applications/isy.app 2>&1 || true
+          echo "=== 验证代码签名 ==="
+          codesign -dv build/isy.xcarchive/Products/Applications/isy.app 2>&1 || true
           cat > build/export/ExportOptions.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -149,20 +156,23 @@ jobs:
             -archivePath build/isy.xcarchive \
             -exportPath build/export \
             -exportOptionsPlist build/export/ExportOptions.plist \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO || true
-          # 如果 export 失败 (无签名), 用 zip 手动打 ipa
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES || true
+          # 如果 export 失败 (无签名证书), 用 zip 手动打 ipa (保留已嵌入的 entitlements)
           if [ ! -f build/export/isy.ipa ]; then
-            echo "exportArchive 失败 (无签名证书), 改用 zip 打包 Payload"
+            echo "exportArchive 失败 (无开发证书), 改用 zip 打包 Payload (保留 ad-hoc 签名和 entitlements)"
             cd build
             mkdir -p Payload
             cp -r isy.xcarchive/Products/Applications/isy.app Payload/
-            zip -qry isy-unsigned.ipa Payload
+            zip -qry isy.ipa Payload
             cd ..
-            mv build/isy-unsigned.ipa build/export/isy-unsigned.ipa
+            mv build/isy.ipa build/export/isy.ipa
           fi
           ls -la build/export/
+          echo "=== 最终 IPA 内的 entitlements ==="
+          unzip -p build/export/isy.ipa Payload/isy.app/isy > /tmp/isy_bin
+          codesign -d --entitlements - /tmp/isy_bin 2>&1 || true
 
       - name: Upload ipa artifact
         uses: actions/upload-artifact@v4
