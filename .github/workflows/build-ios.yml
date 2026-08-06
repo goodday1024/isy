@@ -154,13 +154,22 @@ jobs:
           echo "Team ID: $TEAM_ID"
           echo "Bundle ID: $BUNDLE_ID"
 
-          # 判断证书/profile 类型: Distribution vs Development
-          # Distribution profile 不含 get-task-allow, Development 含
+          # 判断证书/profile 类型 + 导出方法
+          # 三种组合:
+          #   - get-task-allow=true                         -> Development  (development)
+          #   - get-task-allow=false + ProvisionedDevices   -> Distribution (ad-hoc)
+          #   - get-task-allow=false + ProvisionsAllDevices -> Distribution (enterprise)
+          #   - get-task-allow=false + 都没有               -> Distribution (app-store)
           CERT_IDENTITY="iPhone Distribution"
           EXPORT_METHOD="app-store"
-          if grep -q "get-task-allow" $RUNNER_TEMP/profile.plist 2>/dev/null; then
+          if plutil -extract Entitlements.get-task-allow raw $RUNNER_TEMP/profile.plist 2>/dev/null | grep -q "1"; then
             CERT_IDENTITY="iPhone Developer"
             EXPORT_METHOD="development"
+          elif plutil -extract ProvisionsAllDevices raw $RUNNER_TEMP/profile.plist 2>/dev/null | grep -q "1"; then
+            EXPORT_METHOD="enterprise"
+          elif [ "$(plutil -extract ProvisionedDevices raw $RUNNER_TEMP/profile.plist 2>/dev/null | head -c1)" != "" ]; then
+            # 存在设备列表 -> ad-hoc 分发
+            EXPORT_METHOD="ad-hoc"
           fi
           echo "证书类型: $CERT_IDENTITY"
           echo "导出方法: $EXPORT_METHOD"
