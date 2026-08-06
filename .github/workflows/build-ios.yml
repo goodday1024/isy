@@ -176,6 +176,53 @@ jobs:
           echo "cert_identity=$CERT_IDENTITY" >> $GITHUB_OUTPUT
           echo "export_method=$EXPORT_METHOD" >> $GITHUB_OUTPUT
 
+      - name: Configure signing in xcodeproj (developer mode)
+        if: steps.signing.outputs.mode == 'developer'
+        env:
+          PP_UUID: ${{ steps.signing.outputs.profile_uuid }}
+          TEAM_ID: ${{ steps.signing.outputs.team_id }}
+          BUNDLE_ID: ${{ steps.signing.outputs.bundle_id }}
+          CERT_IDENTITY: ${{ steps.signing.outputs.cert_identity }}
+        run: |
+          # 用 Ruby + xcodeproj gem 只给 isyApp target 设置签名参数.
+          # 不能通过 xcodebuild 命令行传递 PROVISIONING_PROFILE_SPECIFIER,
+          # 因为命令行参数会全局应用到所有 target (含 SPM 包产物 isyCore/isyUI/isyCHot),
+          # 而 SPM 静态库 target 不支持 provisioning profiles, 会报错.
+          # xcodegen (brew) 依赖 xcodeproj gem, 所以 Ruby 可直接 require.
+          ruby <<'RUBY'
+            require 'xcodeproj'
+            project = Xcodeproj::Project.open('isy.xcodeproj')
+            app_target = project.targets.find { |t| t.name == 'isyApp' }
+            abort('isyApp target not found') unless app_target
+            app_target.build_configurations.each do |config|
+              bs = config.build_settings
+              bs['PRODUCT_BUNDLE_IDENTIFIER']   = ENV['BUNDLE_ID']
+              bs['CODE_SIGN_IDENTITY']          = ENV['CERT_IDENTITY']
+              bs['CODE_SIGN_STYLE']             = 'Manual'
+              bs['CODE_SIGNING_REQUIRED']       = 'YES'
+              bs['CODE_SIGNING_ALLOWED']        = 'YES'
+              bs['CODE_SIGN_ENTITLEMENTS']      = 'Sources/isyApp/isy.entitlements'
+              bs['DEVELOPMENT_TEAM']            = ENV['TEAM_ID']
+              bs['PROVISIONING_PROFILE_SPECIFIER'] = ENV['PP_UUID']
+              bs['PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]'] = ENV['PP_UUID']
+            end
+            # 确保 SPM 产物 target 不带任何 profile/签名设置
+            project.targets.each do |t|
+              next if t.name == 'isyApp'
+              t.build_configurations.each do |config|
+                bs = config.build_settings
+                bs.delete('PROVISIONING_PROFILE_SPECIFIER')
+                bs.delete('PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]')
+                bs['CODE_SIGNING_ALLOWED']  = 'NO'
+                bs['CODE_SIGNING_REQUIRED'] = 'NO'
+                bs['CODE_SIGN_IDENTITY']    = ''
+                bs['DEVELOPMENT_TEAM']      = ''
+              end
+            end
+            project.save
+            puts "✓ 已为 isyApp 配置签名: #{ENV['CERT_IDENTITY']} / #{ENV['BUNDLE_ID']}"
+          RUBY
+
       - name: Build archive
         run: |
           mkdir -p build
@@ -183,23 +230,15 @@ jobs:
 
           if [ "$SIGN_MODE" = "developer" ]; then
             echo "=== 使用开发者证书签名 (${{ steps.signing.outputs.cert_identity }}) ==="
-            # 注意: PROVISIONING_PROFILE_SPECIFIER 等参数只对 app target 生效,
-            # SPM 模块 (isyCore/isyUI/isyCHot) 不需要签名, 但 xcodebuild 会继承
-            # 这些参数导致冲突. 通过 Project.yml 已为 SPM 包设置 CODE_SIGNING_ALLOWED=NO.
+            # 签名参数已通过 Ruby 脚本写入 xcodeproj (仅 isyApp target).
+            # 命令行不再传 PROVISIONING_PROFILE_SPECIFIER / CODE_SIGN_IDENTITY / DEVELOPMENT_TEAM /
+            # PRODUCT_BUNDLE_IDENTIFIER, 避免被 SPM target 继承导致 "does not support provisioning profiles".
             xcodebuild archive \
               -project isy.xcodeproj \
               -scheme isyApp \
               -configuration Release \
               -sdk ${{ steps.sdk.outputs.sdk }} \
               -archivePath build/isy.xcarchive \
-              CODE_SIGN_IDENTITY="${{ steps.signing.outputs.cert_identity }}" \
-              CODE_SIGNING_REQUIRED=YES \
-              CODE_SIGNING_ALLOWED=YES \
-              CODE_SIGN_STYLE=Manual \
-              CODE_SIGN_ENTITLEMENTS=Sources/isyApp/isy.entitlements \
-              DEVELOPMENT_TEAM="${{ steps.signing.outputs.team_id }}" \
-              PROVISIONING_PROFILE_SPECIFIER="${{ steps.signing.outputs.profile_uuid }}" \
-              PRODUCT_BUNDLE_IDENTIFIER="${{ steps.signing.outputs.bundle_id }}" \
               ARCHS=arm64
           else
             echo "=== 使用 ad-hoc 签名 (无证书回退) ==="
